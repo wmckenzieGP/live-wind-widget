@@ -31,6 +31,33 @@ which is stateless and cannot drift or gap.
 speed through the identical calculation path. Replay prefetches in 10-minute
 blocks and slices locally, so playback stays smooth without hammering the API.
 
+## Running it as a floating widget
+
+**Desktop launcher (recommended).** Opens the deployed app in a small
+always-on-top window with no browser chrome:
+
+```bash
+pip install -r widget-requirements.txt
+python widget.pyw          # or just double-click widget.pyw
+```
+
+`--frameless` drops the title bar too, at the cost of the close button.
+Point it elsewhere with the `WIND_WIDGET_URL` environment variable.
+
+`pywebview` is deliberately kept out of `requirements.txt` so Streamlit Cloud
+doesn't try to install a GUI toolkit it has no use for.
+
+**Browser alternative.** Chrome → ⋮ → Cast, save and share → Create shortcut…
+→ tick "Open as window", then pin it with PowerToys' Always On Top
+(`Win+Ctrl+T`).
+
+Either way the live refresh keeps running: an always-on-top window is never
+occluded, so its timers are never throttled the way a background tab's are.
+Minimising it *will* throttle it.
+
+Streamlit Cloud sleeps idle apps, so the first load after a quiet spell takes
+~30 s to wake. Leaving the window open avoids this.
+
 ## Data source
 
 InfluxDB at `data.sailgp.tech`, bucket `sailgp`, all mark data at `level ==

@@ -1,0 +1,3 @@
+# Desktop launcher only -- deliberately NOT in requirements.txt, so Streamlit
+# Cloud does not try to install a GUI toolkit it has no use for.
+pywebview==6.2.1
