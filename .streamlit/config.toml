@@ -1,0 +1,15 @@
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f6f7"
+textColor = "#111111"
+
+[client]
+toolbarMode = "minimal"
+showSidebarNavigation = false
