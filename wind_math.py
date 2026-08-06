@@ -150,12 +150,14 @@ def held(flag: pd.Series, dwell: pd.Timedelta) -> bool:
 def board_movements(v: pd.Series, thresh: float) -> list:
     """Timestamps at which the board is confirmed to have begun a new leg.
 
-    A zigzag over the cant trace: hold the extreme reached since the last
+    A zigzag over the height trace: hold the extreme reached since the last
     pivot, and treat a reversal of `thresh` away from it as a new movement.
-    Travel below the threshold never registers, which is what keeps sensor
-    noise and the board settling against its stop from counting -- and a
-    partial cycle that does exceed it counts in full, because under the rule
-    a half-height lift and its return are still two movements.
+
+    Two consequences, both wanted. Travel below the threshold never registers,
+    so sensor noise and the board settling on its stop do not count. And an up
+    that follows an up is not a second movement -- only a reversal is -- so a
+    lift interrupted by a small dip and then continued reads as one movement,
+    while a genuine half-height lift and its return read as two.
 
     The movement is recorded the instant the travel is confirmed, not when the
     leg finishes, so the count leads the sailors rather than trailing them.
@@ -182,25 +184,6 @@ def board_movements(v: pd.Series, thresh: float) -> list:
     return out
 
 
-def merge_movements(*lists, within: pd.Timedelta) -> list:
-    """Combine movement times from several axes into one sequence.
-
-    A manoeuvre often swings cant and rake at once, and that is one movement,
-    not two -- so a time that coincides with one already taken from a
-    *different* axis is dropped.
-
-    Movements on the same axis are never collapsed, however close together they
-    fall. Pumping a board can put two genuine legs well inside a second, and
-    swallowing those would under-count, which is the direction that costs a
-    penalty.
-    """
-    tagged = sorted((t, axis) for axis, lst in enumerate(lists) for t in lst)
-    out = []
-    for t, axis in tagged:
-        if any(a != axis and abs(t - s) <= within for s, a in out):
-            continue
-        out.append((t, axis))
-    return [t for t, _ in out]
 
 
 # ---------------------------------------------------------------------------

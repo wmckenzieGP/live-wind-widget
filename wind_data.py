@@ -53,24 +53,13 @@ YAW_RATE = "RATE_YAW_deg_s_1"
 
 BOAT_ANALOG = [RUD_AVG, RUD_DIFF, PITCH, CAMBER, CAMBER_TARGET, SOG, YAW_RATE]
 
-# Daggerboard, for the cycling counter. Two axes, because which one the crew
-# moves depends entirely on the conditions:
-#
-#   cant  -- raising and lowering the board. How the boards are cycled when
-#            foiling, and swapped at manoeuvres.
-#   rake  -- rotating the board fore and aft. In light air the boards stay
-#            fully deployed (cant pinned around 95%) and the cycling happens
-#            here instead: measured at Abu Dhabi 2025-11-29 the cant moved
-#            0.75% across the whole race while the rake swung -4 to +5 deg
-#            every few seconds.
-#
-# Watching only cant made the counter blind in exactly the conditions it
-# matters most, so both are counted.
-CANT_P = "CANT_POS_PCT_P_pct"
-CANT_S = "CANT_POS_PCT_S_pct"
-RAKE_P = "ANGLE_DB_RAKE_P_deg"
-RAKE_S = "ANGLE_DB_RAKE_S_deg"
-BOARD_CHANNELS = [CANT_P, CANT_S, RAKE_P, RAKE_S]
+# Daggerboard vertical height, from the linear position sensor. The rule counts
+# the board going up and down, so height is the quantity it is actually about:
+# it reads the movement directly instead of inferring it from cant or rake,
+# neither of which tracks it in all conditions. Full travel is about 1900 mm.
+HEIGHT_P = "LENGTH_DB_H_P_mm"
+HEIGHT_S = "LENGTH_DB_H_S_mm"
+BOARD_CHANNELS = [HEIGHT_P, HEIGHT_S]
 
 # Below this gate-to-gate separation the marks are stowed, not deployed,
 # and the course axis is meaningless.

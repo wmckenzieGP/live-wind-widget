@@ -99,72 +99,46 @@ and into negative numbers once the limit is passed. Movements age out
 individually as they fall out of the 60-second window, so the count climbs back
 one at a time.
 
-### Two axes, because it depends on the conditions
-
-A board can be moved two ways, and which one the crew uses depends entirely on
-the wind:
-
-| Axis | Channel | When it is the one that moves |
-|---|---|---|
-| **Cant** | `CANT_POS_PCT_P_pct` / `_S_pct` | Foiling — boards raised, lowered and swapped at manoeuvres |
-| **Rake** | `ANGLE_DB_RAKE_P_deg` / `_S_deg` | Light air — boards stay deployed and get pumped fore and aft |
-
-Watching only cant made the counter blind in exactly the conditions it matters
-most. At Abu Dhabi on 2025-11-29 the cant moved **0.75% across the whole race**
-— boards pinned down at 95% of stroke — while the rake swung −4° to +5° every
-few seconds. The counter read zero the entire time, through a race that drew a
-penalty. Both axes are now counted.
-
 ### Counting a movement
 
-`wind_math.board_movements` walks each axis holding the extreme reached since
-the last pivot, and treats a reversal past that axis's threshold as a new
-movement. Each leg counts once, so a part-way lift and its return are two
-movements, exactly as the rule reads. The movement is recorded the instant the
-travel is confirmed, not when the leg finishes — the count has to lead the
-sailors, not trail them.
+From `LENGTH_DB_H_P_mm` / `LENGTH_DB_H_S_mm` — daggerboard vertical height off
+the linear position sensor, 10 Hz. The rule counts the board going up and down,
+so height is the quantity it is actually about; reading it directly beats
+inferring it from cant or rake, neither of which tracks the movement in all
+conditions.
 
-`merge_movements` then combines the axes. A manoeuvre often swings cant and
-rake at once and that is one movement, not two, so a time coinciding with one
-already taken from the *other* axis is dropped. Movements on the *same* axis
-are never collapsed however close together they fall — pumping puts genuine
-legs within a second or two of each other, and swallowing those would
-under-count, which is the direction that costs a penalty.
+`wind_math.board_movements` walks the trace holding the extreme reached since
+the last pivot, and treats a reversal of **200 mm** away from it as a new
+movement. Two consequences, both wanted:
 
-### Thresholds
+- **An up after an up is not a second movement** — only a reversal is. So a
+  lift interrupted by a small dip and then continued counts once, while a
+  genuine part-way lift and its return count twice.
+- **Travel under 200 mm never registers**, so sensor noise and the board
+  settling on its stop are ignored. Full travel is about 1900 mm and a parked
+  board measures 0.5 mm peak to peak, so the threshold has an enormous margin.
 
-**Rake, 4° (default).** Leg travel separates cleanly by condition:
-
-| | p25 | p50 | p90 |
-|---|---|---|---|
-| Light air (pumping) | 2.0–6.1° | **5.9–6.9°** | 7.5–7.8° |
-| Foiling (flight control trim) | 1.0° | **1.2–1.3°** | 3.3–3.6° |
-
-4° sits in the gap, so deliberate pumping counts and the flight controller's
-continuous trimming does not. It is a slider in Settings.
-
-**Cant, 12% of stroke (fixed).** Noise with a board parked is under 3% peak to
-peak. Real cant legs run from about 5% to a full 100% in a smooth continuum
-with no natural gap, so this one is a rule-interpretation call; 12% counts only
-a substantial raise or lower.
+The movement is recorded the instant the travel is confirmed, not when the leg
+finishes — the count has to lead the sailors, not trail them.
 
 ### Validation
 
-Replaying Abu Dhabi 2025-11-29 (race start 10:47:00Z), the starboard board:
+Replaying Abu Dhabi 2025-11-29 (race start 10:47:00Z, light air, TWS ~11 km/h),
+the starboard board:
 
 ```
 10:46:50   1 available
-10:47:00   2 available   <- start
+10:47:00   1 available   <- start
 10:47:10   0 available
-10:47:30   0 available
 10:48:20   0 available
-10:48:30  -1 available   <- over the limit
-10:49:00  -1 available
+10:48:30  -2 available   <- over the limit
+10:48:50  -1 available
 ```
 
 First breach 90 s after the start, matching the penalty taken in that race —
-and the counter sat at zero for a full minute beforehand, which is the warning
-that would have prevented it.
+and the counter sat at zero beforehand, which is the warning that would have
+prevented it. Across a breezy session (2026-07-26, TWS 33 km/h) the same
+threshold never goes below 3 available, so it does not cry wolf when foiling.
 
 ### Keeping it live
 
@@ -179,7 +153,7 @@ from the rest of the widget:
   range query dropped from 13.8 s to 1.4 s.
 - **Incremental fetch.** A rolling 150-second trace is held in session state and
   extended with only the samples that arrived since the last one, typically
-  about a second's worth. A tick costs ~0.28 s of query and ~5 ms of counting.
+  about a second's worth. A tick costs ~0.28 s of query and ~6 ms of counting.
   If the buffer falls more than 20 s behind it is refilled outright rather than
   spliced across a hole.
 
@@ -249,8 +223,7 @@ InfluxDB at `data.sailgp.tech`, bucket `sailgp`. Mark data is at `level ==
 | `ANGLE_CA1_deg` / `CAMBER_INPUT_deg` | strm | Camber and its demand |
 | `BTN_WT_P_CAMBER_ZERO` / `BTN_WT_S_CAMBER_ZERO` | strm | Camber-zero buttons |
 | `GPS_SOG_km_h_1` / `RATE_YAW_deg_s_1` | strm | Not displayed — they gate the alarms |
-| `CANT_POS_PCT_P_pct` / `CANT_POS_PCT_S_pct` | strm | Daggerboard cant, % of stroke, 10 Hz |
-| `ANGLE_DB_RAKE_P_deg` / `ANGLE_DB_RAKE_S_deg` | strm | Daggerboard rake — the light-air cycling axis |
+| `LENGTH_DB_H_P_mm` / `LENGTH_DB_H_S_mm` | strm | Daggerboard height, mm, 10 Hz — the cycling counter |
 
 Marks: `WG1`/`WG2` (windward gate), `LG1`/`LG2` (leeward gate), `M1`,
 `SL1`/`SL2` (committee boat / pin).
@@ -297,7 +270,7 @@ only and contains live credentials.
 |---|---|
 | `app.py` | UI, layout, metrics, alarm rules, mode control, refresh timing |
 | `wind_data.py` | InfluxDB queries, pooled client, mark and boat channel constants |
-| `wind_math.py` | Circular statistics, dwell filtering, board detection, geometry, colour ramp |
+| `wind_math.py` | Circular statistics, dwell filtering, board movement detection, geometry, colour ramp |
 | `config.py` | Credentials |
 
 Each poll runs its queries concurrently (`wind_data.parallel`), so the cycle

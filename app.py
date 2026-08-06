@@ -18,8 +18,8 @@ import streamlit as st
 import wind_data as wd
 from wind_math import (bearing, board_movements, circular_ema,
                        circular_mean_columns, circular_sma, distance_m, held,
-                       merge_movements, midpoint, shade, signed_diff,
-                       signed_diff_series, sustained_extremes)
+                       midpoint, shade, signed_diff, signed_diff_series,
+                       sustained_extremes)
 
 EMA_HALFLIFE = pd.Timedelta("20s")
 LIVE_REFRESH_S = 3
@@ -67,19 +67,10 @@ BOARD_LIMIT = 6
 BOARD_WINDOW = pd.Timedelta("60s")
 BOARD_BUFFER = pd.Timedelta("150s")   # trace held locally; > window, for warm-up
 BOARD_TICK_S = 1
-# Travel that counts as a movement, per axis.
-#
-# Rake is the axis that matters in light air, where the boards stay deployed
-# and get pumped fore and aft. Measured leg travel separates cleanly there:
-# light-air pumping runs 6-8 deg a leg, while the small continuous trimming the
-# flight controller does when foiling runs 1-2 deg. 4 deg sits in the gap, so
-# pumping counts and flight control does not.
-BOARD_RAKE_THRESH_DEFAULT = 4.0
-# Cant is the axis used when foiling -- boards raised and lowered, and swapped
-# at manoeuvres. Noise with the board parked is under 3% of stroke.
-BOARD_CANT_THRESH = 12.0
-# Both axes swing together through a manoeuvre; that is one movement, not two.
-BOARD_MERGE = pd.Timedelta("2s")
+# Height change that counts as a movement. Full board travel is about 1900 mm
+# and real raises and lowers run the whole way, so this only has to clear the
+# sensor's own jitter.
+BOARD_THRESH_MM = 200.0
 # Past this the buffer is too stale to extend, so refill it outright.
 BOARD_REFILL_GAP = pd.Timedelta("20s")
 
@@ -403,34 +394,25 @@ def board_buffer(now: pd.Timestamp) -> pd.DataFrame:
     return buf
 
 
-def board_counts(buf: pd.DataFrame, now: pd.Timestamp, rake_thresh: float) -> dict:
+def board_counts(buf: pd.DataFrame, now: pd.Timestamp) -> dict:
     """Movements left on each board inside the rolling minute.
 
-    Counts cant and rake together: whichever axis the crew is using, moving the
-    board is moving the board. The window is anchored to the wall clock, not to
-    the newest sample -- a movement made 61 s ago has aged out whether or not
-    the feed is keeping up. Feed lag shows in `age` instead, where it can be
-    seen.
+    The window is anchored to the wall clock, not to the newest sample -- a
+    movement made 61 s ago has aged out whether or not the feed is keeping up.
+    Feed lag shows in `age` instead, where it can be seen.
     """
     r = {"port": None, "stbd": None, "age": None, "moves": {}}
     if buf is None or buf.empty:
         return r
     r["age"] = max((now - buf.index[-1]).total_seconds(), 0.0)
     cutoff = now - BOARD_WINDOW
-    sides = (("port", wd.CANT_P, wd.RAKE_P), ("stbd", wd.CANT_S, wd.RAKE_S))
-    for side, cant_col, rake_col in sides:
-        axes, seen = [], False
-        for col, thresh in ((cant_col, BOARD_CANT_THRESH), (rake_col, rake_thresh)):
-            if col not in buf.columns:
-                continue
-            v = buf[col].dropna()
-            if v.empty:
-                continue
-            seen = True
-            axes.append(board_movements(v, thresh))
-        if not seen:
+    for side, col in (("port", wd.HEIGHT_P), ("stbd", wd.HEIGHT_S)):
+        if col not in buf.columns:
             continue
-        used = [t for t in merge_movements(*axes, within=BOARD_MERGE) if t > cutoff]
+        v = buf[col].dropna()
+        if v.empty:
+            continue
+        used = [t for t in board_movements(v, BOARD_THRESH_MM) if t > cutoff]
         r["moves"][side] = len(used)
         r[side] = BOARD_LIMIT - len(used)
     return r
@@ -607,14 +589,6 @@ if mode == "Replay":
 
 with st.expander("Settings"):
     sma_min = st.slider("Course average (minutes)", 1, 20, 10, key="sma")
-    board_thresh = st.slider(
-        "Board rake movement threshold (deg)", 1.0, 8.0,
-        BOARD_RAKE_THRESH_DEFAULT, 0.5, key="bthresh",
-        help="Rake travel that counts as one movement -- the axis that gets "
-             "pumped in light air. Measured, light-air pumping runs 6-8 deg a "
-             "leg while the flight controller's trimming when foiling runs "
-             "1-2 deg, so 4 deg counts the first and not the second. Cant is "
-             "counted alongside it at a fixed 12% of stroke.")
 sma = pd.Timedelta(minutes=sma_min)
 
 
@@ -662,7 +636,7 @@ def draw_boards():
         now = virtual_now()
         buf = _upto(_replay_board(now.floor(REPLAY_BLOCK)), now)
 
-    counts = board_counts(buf, now, board_thresh)
+    counts = board_counts(buf, now)
     st.markdown(render_boards(counts)
                 + status_line(list(ss["wind_bits"]) + [board_age_bit(counts)]),
                 unsafe_allow_html=True)
