@@ -97,6 +97,52 @@ def signed_diff(a: float, b: float) -> float:
     return float((a - b + 180.0) % 360.0 - 180.0)
 
 
+def signed_diff_series(s: pd.Series, ref: float) -> pd.Series:
+    """Vectorised signed_diff of a bearing series against one reference."""
+    if s.empty or ref is None or np.isnan(ref):
+        return pd.Series(dtype=float, index=s.index)
+    return (s - ref + 180.0) % 360.0 - 180.0
+
+
+# ---------------------------------------------------------------------------
+# Dwell filtering
+#
+# Both helpers below answer the same question -- did this actually persist, or
+# was it a blip? A boat sailing past a mark yanks one mark's wind for a second
+# or two; that must not widen the reported range.
+# ---------------------------------------------------------------------------
+
+def sustained_extremes(s: pd.Series, dwell: pd.Timedelta) -> tuple[float, float]:
+    """(low, high) levels the series held continuously for at least `dwell`.
+
+    A rolling minimum only rises once every sample in the trailing window is
+    high, so the maximum of that rolling minimum is the highest level actually
+    sustained for the full dwell. The low side is the mirror image. Spikes
+    shorter than the dwell always share their window with normal samples and
+    are erased.
+    """
+    s = s.dropna()
+    if s.empty:
+        return float("nan"), float("nan")
+    roll_min = s.rolling(dwell).min()
+    roll_max = s.rolling(dwell).max()
+    # Leading windows are shorter than the dwell, so nothing in them is
+    # confirmed yet -- a spike there would survive. Drop them.
+    keep = s.index >= s.index[0] + dwell
+    if not keep.any():
+        return float("nan"), float("nan")
+    return float(roll_max[keep].min()), float(roll_min[keep].max())
+
+
+def held(flag: pd.Series, dwell: pd.Timedelta) -> bool:
+    """True if `flag` is currently True and has been for at least `dwell`."""
+    if flag.empty or not bool(flag.iloc[-1]):
+        return False
+    off = np.flatnonzero(~flag.to_numpy(dtype=bool))
+    start = flag.index[off[-1] + 1] if off.size else flag.index[0]
+    return bool(flag.index[-1] - start >= dwell)
+
+
 # ---------------------------------------------------------------------------
 # Course geometry
 # ---------------------------------------------------------------------------

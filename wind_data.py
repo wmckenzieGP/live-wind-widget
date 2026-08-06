@@ -12,6 +12,7 @@ the wind sits near 0/360. TWS is scalar, so `mean` is fine.
 from __future__ import annotations
 
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 import arrow
 import pandas as pd
@@ -32,6 +33,24 @@ TWS = "TWS_MDSS_km_h_1"
 LAT = "LATITUDE_MDSS_deg"
 LON = "LONGITUDE_MDSS_deg"
 GPS_SCALE = 10_000_000
+
+# Boat channels live at level "strm", not "mdss".
+BOAT = "NZL"
+RUD_AVG = "ANGLE_RUD_AVG_deg"
+RUD_DIFF = "ANGLE_RUD_DIFF_deg"
+PITCH = "PITCH_deg"
+# CA1 is the root camber actuator, the one that tracks the crew's demand
+# one-for-one. CA4-CA6 fall away down the wing because of twist, and CA2/CA3
+# are not populated.
+CAMBER = "ANGLE_CA1_deg"
+CAMBER_TARGET = "CAMBER_INPUT_deg"          # magnitude, always positive
+CAMBER_ZERO = ["BTN_WT_P_CAMBER_ZERO", "BTN_WT_S_CAMBER_ZERO"]
+# Not displayed -- these gate the alarms, which only mean anything while the
+# boat is actually sailing.
+SOG = "GPS_SOG_km_h_1"
+YAW_RATE = "RATE_YAW_deg_s_1"
+
+BOAT_ANALOG = [RUD_AVG, RUD_DIFF, PITCH, CAMBER, CAMBER_TARGET, SOG, YAW_RATE]
 
 # Below this gate-to-gate separation the marks are stowed, not deployed,
 # and the course axis is meaningless.
@@ -112,6 +131,45 @@ union(tables: [twd, tws])
 
 
 # ---------------------------------------------------------------------------
+# Boat
+# ---------------------------------------------------------------------------
+
+def fetch_boat(start, end, boat: str = BOAT) -> pd.DataFrame:
+    """Return a 1 s frame of boat channels, one column per measurement.
+
+    Analogue channels decimate with `last`; the camber-zero buttons use `max`
+    so a press shorter than a second still shows up.
+    """
+    def _stream(measurements: list[str], fn: str) -> str:
+        mf = " or ".join(f'r["_measurement"] == "{m}"' for m in measurements)
+        return f"""from(bucket: "{BUCKET}")
+  |> range(start: {_fmt(start)}, stop: {_fmt(end)})
+  |> filter(fn: (r) => r["_field"] == "value")
+  |> filter(fn: (r) => r["level"] == "strm")
+  |> filter(fn: (r) => r["boat"] == "{boat}")
+  |> filter(fn: (r) => {mf})
+  |> aggregateWindow(every: 1s, fn: {fn}, createEmpty: false)"""
+
+    flux = f"""
+analog = {_stream(BOAT_ANALOG, "last")}
+
+buttons = {_stream(CAMBER_ZERO, "max")}
+
+union(tables: [analog, buttons])
+  |> keep(columns: ["_time", "_value", "_measurement"])
+"""
+    df = _query(flux)
+    if df.empty or "_measurement" not in df.columns:
+        return pd.DataFrame()
+
+    df["_time"] = _naive_utc(df["_time"])
+    out = df.pivot_table(index="_time", columns="_measurement", values="_value")
+    out.index.name = "time"
+    out.columns.name = None
+    return out.sort_index()
+
+
+# ---------------------------------------------------------------------------
 # Positions
 # ---------------------------------------------------------------------------
 
@@ -148,6 +206,19 @@ from(bucket: "{BUCKET}")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def parallel(*calls):
+    """Run zero-argument fetches concurrently and return their results in order.
+
+    Each poll needs several independent queries; run serially they add up to
+    more than the refresh interval. Nothing here touches Streamlit, so worker
+    threads are safe.
+    """
+    if not calls:
+        return []
+    with ThreadPoolExecutor(max_workers=len(calls)) as ex:
+        return [f.result() for f in [ex.submit(c) for c in calls]]
+
 
 def latest_data_time():
     """Most recent mark timestamp in the bucket, or None. Used to tell whether
