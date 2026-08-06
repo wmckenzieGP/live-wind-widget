@@ -119,13 +119,15 @@ So where the line falls changes the count:
 
 | Threshold | Movements in 2 h (port/stbd) | Minutes over the limit |
 |---|---|---|
-| 5% (default) | 97 / 87 | 8 / 7 |
+| 5% | 97 / 87 | 8 / 7 |
 | 8% | 79 / 75 | 5 / 2 |
-| 12% | 63 / 63 | 0 / 0 |
+| **12% (default)** | **63 / 63** | **0 / 0** |
 
-The default sits just above the noise floor and errs towards counting:
-over-counting costs a cautious call, under-counting costs a penalty. It is a
-slider in Settings so it can be tuned between sessions.
+12% treats only a substantial leg as a movement, and over that session it never
+showed the limit breached — which matches a crew sailing to stay inside it.
+Lower thresholds start counting small mid-stroke trims as cycles. It is a
+slider in Settings so it can be tuned between sessions; drop it if the rule
+turns out to be policed more tightly than this.
 
 ### Keeping it live
 

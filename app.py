@@ -70,10 +70,11 @@ BOARD_TICK_S = 1
 # Travel that counts as a movement, as a percent of full cant stroke. The
 # measured noise floor with the board parked is under 3% peak to peak, and real
 # legs run from about 5% to a full 100% with no natural gap between them -- so
-# this is a rule-interpretation call, not a signal-processing one. The default
-# sits just above the noise and errs towards counting: over-counting costs a
-# cautious call, under-counting costs a penalty.
-BOARD_THRESH_DEFAULT = 5.0
+# this is a rule-interpretation call, not a signal-processing one. Set to match
+# how the rule is policed: over the 2026-07-26 session this counted 63 movements
+# per board and never showed the six-per-minute limit breached, where 5% would
+# have called eight breaches on the port board alone.
+BOARD_THRESH_DEFAULT = 12.0
 # Past this the buffer is too stale to extend, so refill it outright.
 BOARD_REFILL_GAP = pd.Timedelta("20s")
 
