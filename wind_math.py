@@ -182,6 +182,27 @@ def board_movements(v: pd.Series, thresh: float) -> list:
     return out
 
 
+def merge_movements(*lists, within: pd.Timedelta) -> list:
+    """Combine movement times from several axes into one sequence.
+
+    A manoeuvre often swings cant and rake at once, and that is one movement,
+    not two -- so a time that coincides with one already taken from a
+    *different* axis is dropped.
+
+    Movements on the same axis are never collapsed, however close together they
+    fall. Pumping a board can put two genuine legs well inside a second, and
+    swallowing those would under-count, which is the direction that costs a
+    penalty.
+    """
+    tagged = sorted((t, axis) for axis, lst in enumerate(lists) for t in lst)
+    out = []
+    for t, axis in tagged:
+        if any(a != axis and abs(t - s) <= within for s, a in out):
+            continue
+        out.append((t, axis))
+    return [t for t, _ in out]
+
+
 # ---------------------------------------------------------------------------
 # Course geometry
 # ---------------------------------------------------------------------------

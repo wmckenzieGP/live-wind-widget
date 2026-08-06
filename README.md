@@ -99,35 +99,72 @@ and into negative numbers once the limit is passed. Movements age out
 individually as they fall out of the 60-second window, so the count climbs back
 one at a time.
 
+### Two axes, because it depends on the conditions
+
+A board can be moved two ways, and which one the crew uses depends entirely on
+the wind:
+
+| Axis | Channel | When it is the one that moves |
+|---|---|---|
+| **Cant** | `CANT_POS_PCT_P_pct` / `_S_pct` | Foiling — boards raised, lowered and swapped at manoeuvres |
+| **Rake** | `ANGLE_DB_RAKE_P_deg` / `_S_deg` | Light air — boards stay deployed and get pumped fore and aft |
+
+Watching only cant made the counter blind in exactly the conditions it matters
+most. At Abu Dhabi on 2025-11-29 the cant moved **0.75% across the whole race**
+— boards pinned down at 95% of stroke — while the rake swung −4° to +5° every
+few seconds. The counter read zero the entire time, through a race that drew a
+penalty. Both axes are now counted.
+
 ### Counting a movement
 
-From `CANT_POS_PCT_P_pct` / `_S_pct` — measured cant position as a percentage
-of full stroke, sampled at 10 Hz. `wind_math.board_movements` walks the trace
-holding the extreme reached since the last pivot, and treats a reversal of
-`BOARD_THRESH` away from it as a new movement. Each leg counts once, so a
-part-way lift and its return are two movements, exactly as the rule reads.
+`wind_math.board_movements` walks each axis holding the extreme reached since
+the last pivot, and treats a reversal past that axis's threshold as a new
+movement. Each leg counts once, so a part-way lift and its return are two
+movements, exactly as the rule reads. The movement is recorded the instant the
+travel is confirmed, not when the leg finishes — the count has to lead the
+sailors, not trail them.
 
-The movement is recorded the instant the travel is confirmed, not when the leg
-finishes — the count has to lead the sailors, not trail them.
+`merge_movements` then combines the axes. A manoeuvre often swings cant and
+rake at once and that is one movement, not two, so a time coinciding with one
+already taken from the *other* axis is dropped. Movements on the *same* axis
+are never collapsed however close together they fall — pumping puts genuine
+legs within a second or two of each other, and swallowing those would
+under-count, which is the direction that costs a penalty.
 
-**The threshold is a rule call, not a signal-processing one.** Measured over
-the 2026-07-26 session: with a board genuinely parked the trace is flat to
-0.03–3% peak to peak, so noise and settling against the stop are easy to reject.
-But real legs run from about 5% to a full 100% of stroke in a smooth continuum
-with no natural gap, and the small ones sit mid-stroke rather than at the ends.
-So where the line falls changes the count:
+### Thresholds
 
-| Threshold | Movements in 2 h (port/stbd) | Minutes over the limit |
-|---|---|---|
-| 5% | 97 / 87 | 8 / 7 |
-| 8% | 79 / 75 | 5 / 2 |
-| **12% (default)** | **63 / 63** | **0 / 0** |
+**Rake, 4° (default).** Leg travel separates cleanly by condition:
 
-12% treats only a substantial leg as a movement, and over that session it never
-showed the limit breached — which matches a crew sailing to stay inside it.
-Lower thresholds start counting small mid-stroke trims as cycles. It is a
-slider in Settings so it can be tuned between sessions; drop it if the rule
-turns out to be policed more tightly than this.
+| | p25 | p50 | p90 |
+|---|---|---|---|
+| Light air (pumping) | 2.0–6.1° | **5.9–6.9°** | 7.5–7.8° |
+| Foiling (flight control trim) | 1.0° | **1.2–1.3°** | 3.3–3.6° |
+
+4° sits in the gap, so deliberate pumping counts and the flight controller's
+continuous trimming does not. It is a slider in Settings.
+
+**Cant, 12% of stroke (fixed).** Noise with a board parked is under 3% peak to
+peak. Real cant legs run from about 5% to a full 100% in a smooth continuum
+with no natural gap, so this one is a rule-interpretation call; 12% counts only
+a substantial raise or lower.
+
+### Validation
+
+Replaying Abu Dhabi 2025-11-29 (race start 10:47:00Z), the starboard board:
+
+```
+10:46:50   1 available
+10:47:00   2 available   <- start
+10:47:10   0 available
+10:47:30   0 available
+10:48:20   0 available
+10:48:30  -1 available   <- over the limit
+10:49:00  -1 available
+```
+
+First breach 90 s after the start, matching the penalty taken in that race —
+and the counter sat at zero for a full minute beforehand, which is the warning
+that would have prevented it.
 
 ### Keeping it live
 
@@ -213,6 +250,7 @@ InfluxDB at `data.sailgp.tech`, bucket `sailgp`. Mark data is at `level ==
 | `BTN_WT_P_CAMBER_ZERO` / `BTN_WT_S_CAMBER_ZERO` | strm | Camber-zero buttons |
 | `GPS_SOG_km_h_1` / `RATE_YAW_deg_s_1` | strm | Not displayed — they gate the alarms |
 | `CANT_POS_PCT_P_pct` / `CANT_POS_PCT_S_pct` | strm | Daggerboard cant, % of stroke, 10 Hz |
+| `ANGLE_DB_RAKE_P_deg` / `ANGLE_DB_RAKE_S_deg` | strm | Daggerboard rake — the light-air cycling axis |
 
 Marks: `WG1`/`WG2` (windward gate), `LG1`/`LG2` (leeward gate), `M1`,
 `SL1`/`SL2` (committee boat / pin).

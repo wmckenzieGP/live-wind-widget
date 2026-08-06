@@ -53,10 +53,24 @@ YAW_RATE = "RATE_YAW_deg_s_1"
 
 BOAT_ANALOG = [RUD_AVG, RUD_DIFF, PITCH, CAMBER, CAMBER_TARGET, SOG, YAW_RATE]
 
-# Daggerboard cant position, as a percentage of full stroke. Sampled at 10 Hz
-# and used only by the cycling counter, which needs its own fast path.
+# Daggerboard, for the cycling counter. Two axes, because which one the crew
+# moves depends entirely on the conditions:
+#
+#   cant  -- raising and lowering the board. How the boards are cycled when
+#            foiling, and swapped at manoeuvres.
+#   rake  -- rotating the board fore and aft. In light air the boards stay
+#            fully deployed (cant pinned around 95%) and the cycling happens
+#            here instead: measured at Abu Dhabi 2025-11-29 the cant moved
+#            0.75% across the whole race while the rake swung -4 to +5 deg
+#            every few seconds.
+#
+# Watching only cant made the counter blind in exactly the conditions it
+# matters most, so both are counted.
 CANT_P = "CANT_POS_PCT_P_pct"
 CANT_S = "CANT_POS_PCT_S_pct"
+RAKE_P = "ANGLE_DB_RAKE_P_deg"
+RAKE_S = "ANGLE_DB_RAKE_S_deg"
+BOARD_CHANNELS = [CANT_P, CANT_S, RAKE_P, RAKE_S]
 
 # Below this gate-to-gate separation the marks are stowed, not deployed,
 # and the course axis is meaningless.
@@ -211,30 +225,31 @@ union(tables: [analog, buttons])
 
 
 # ---------------------------------------------------------------------------
-# Daggerboard cant
+# Daggerboard
 #
 # The cycling counter is the one metric that must not lag, so this is kept as
-# narrow as it can be: two channels, no joins, decimated server-side, and
+# narrow as it can be: four channels, no joins, decimated server-side, and
 # normally fetched as a one-second delta onto a buffer the caller already holds.
 # ---------------------------------------------------------------------------
 
-CANT_EVERY = "200ms"        # far finer than a board movement needs
+BOARD_EVERY = "200ms"       # far finer than a board movement needs
 
 
-def _cant_flux(range_expr: str) -> str:
+def _board_flux(range_expr: str) -> str:
+    mf = " or ".join(f'r["_measurement"] == "{m}"' for m in BOARD_CHANNELS)
     return f"""
 from(bucket: "{BUCKET}")
   |> range({range_expr})
-  |> filter(fn: (r) => r["_measurement"] == "{CANT_P}" or r["_measurement"] == "{CANT_S}")
+  |> filter(fn: (r) => {mf})
   |> filter(fn: (r) => r["_field"] == "value")
   |> filter(fn: (r) => r["level"] == "strm")
   |> filter(fn: (r) => r["boat"] == "{BOAT}")
-  |> aggregateWindow(every: {CANT_EVERY}, fn: last, createEmpty: false)
+  |> aggregateWindow(every: {BOARD_EVERY}, fn: last, createEmpty: false)
   |> keep(columns: ["_time", "_value", "_measurement"])
 """
 
 
-def _cant_frame(flux: str) -> pd.DataFrame:
+def _board_frame(flux: str) -> pd.DataFrame:
     df = _query(flux)
     if df.empty or "_measurement" not in df.columns:
         return pd.DataFrame()
@@ -245,20 +260,20 @@ def _cant_frame(flux: str) -> pd.DataFrame:
     return out.sort_index()
 
 
-def fetch_cant_recent(window: pd.Timedelta) -> pd.DataFrame:
+def fetch_board_recent(window: pd.Timedelta) -> pd.DataFrame:
     """Backfill: the trailing `window`, relative to server time so no client
     clock skew creeps in."""
-    return _cant_frame(_cant_flux(f"start: -{int(window.total_seconds())}s"))
+    return _board_frame(_board_flux(f"start: -{int(window.total_seconds())}s"))
 
 
-def fetch_cant_since(after: pd.Timestamp) -> pd.DataFrame:
+def fetch_board_since(after: pd.Timestamp) -> pd.DataFrame:
     """The steady-state call -- only what has arrived since the last sample."""
-    return _cant_frame(_cant_flux(f"start: {_fmt_ns(after)}"))
+    return _board_frame(_board_flux(f"start: {_fmt_ns(after)}"))
 
 
-def fetch_cant_range(start, end) -> pd.DataFrame:
+def fetch_board_range(start, end) -> pd.DataFrame:
     """Explicit window, for replay."""
-    return _cant_frame(_cant_flux(f"start: {_fmt(start)}, stop: {_fmt(end)}"))
+    return _board_frame(_board_flux(f"start: {_fmt(start)}, stop: {_fmt(end)}"))
 
 
 # ---------------------------------------------------------------------------

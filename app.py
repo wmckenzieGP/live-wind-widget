@@ -18,8 +18,8 @@ import streamlit as st
 import wind_data as wd
 from wind_math import (bearing, board_movements, circular_ema,
                        circular_mean_columns, circular_sma, distance_m, held,
-                       midpoint, shade, signed_diff, signed_diff_series,
-                       sustained_extremes)
+                       merge_movements, midpoint, shade, signed_diff,
+                       signed_diff_series, sustained_extremes)
 
 EMA_HALFLIFE = pd.Timedelta("20s")
 LIVE_REFRESH_S = 3
@@ -67,14 +67,19 @@ BOARD_LIMIT = 6
 BOARD_WINDOW = pd.Timedelta("60s")
 BOARD_BUFFER = pd.Timedelta("150s")   # trace held locally; > window, for warm-up
 BOARD_TICK_S = 1
-# Travel that counts as a movement, as a percent of full cant stroke. The
-# measured noise floor with the board parked is under 3% peak to peak, and real
-# legs run from about 5% to a full 100% with no natural gap between them -- so
-# this is a rule-interpretation call, not a signal-processing one. Set to match
-# how the rule is policed: over the 2026-07-26 session this counted 63 movements
-# per board and never showed the six-per-minute limit breached, where 5% would
-# have called eight breaches on the port board alone.
-BOARD_THRESH_DEFAULT = 12.0
+# Travel that counts as a movement, per axis.
+#
+# Rake is the axis that matters in light air, where the boards stay deployed
+# and get pumped fore and aft. Measured leg travel separates cleanly there:
+# light-air pumping runs 6-8 deg a leg, while the small continuous trimming the
+# flight controller does when foiling runs 1-2 deg. 4 deg sits in the gap, so
+# pumping counts and flight control does not.
+BOARD_RAKE_THRESH_DEFAULT = 4.0
+# Cant is the axis used when foiling -- boards raised and lowered, and swapped
+# at manoeuvres. Noise with the board parked is under 3% of stroke.
+BOARD_CANT_THRESH = 12.0
+# Both axes swing together through a manoeuvre; that is one movement, not two.
+BOARD_MERGE = pd.Timedelta("2s")
 # Past this the buffer is too stale to extend, so refill it outright.
 BOARD_REFILL_GAP = pd.Timedelta("20s")
 
@@ -167,10 +172,10 @@ def _replay_block(block_start: pd.Timestamp, sma_s: int):
 
 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=32)
-def _replay_cant(block_start: pd.Timestamp) -> pd.DataFrame:
-    """Cant trace for one replay block, with enough warm-up behind it for the
+def _replay_board(block_start: pd.Timestamp) -> pd.DataFrame:
+    """Board trace for one replay block, with enough warm-up behind it for the
     detector to have established a direction before the block starts."""
-    return wd.fetch_cant_range(block_start - BOARD_BUFFER,
+    return wd.fetch_board_range(block_start - BOARD_BUFFER,
                                block_start + REPLAY_BLOCK)
 
 
@@ -378,45 +383,54 @@ def board_buffer(now: pd.Timestamp) -> pd.DataFrame:
     data already in hand. Fetching only what has arrived since the last sample
     keeps a tick down to roughly a quarter of a second.
     """
-    buf = ss.get("cant_buf")
+    buf = ss.get("board_buf")
     if buf is None or buf.empty:
-        buf = wd.fetch_cant_recent(BOARD_BUFFER)
+        buf = wd.fetch_board_recent(BOARD_BUFFER)
     else:
         gap = now - buf.index[-1]
         if gap > BOARD_REFILL_GAP or gap < pd.Timedelta(0):
             # Lost the thread (feed dropped, or the clock moved): start clean
             # rather than splice across a hole.
-            buf = wd.fetch_cant_recent(BOARD_BUFFER)
+            buf = wd.fetch_board_recent(BOARD_BUFFER)
         else:
-            new = wd.fetch_cant_since(buf.index[-1])
+            new = wd.fetch_board_since(buf.index[-1])
             if not new.empty:
                 buf = pd.concat([buf, new])
                 buf = buf[~buf.index.duplicated(keep="last")].sort_index()
     if not buf.empty:
         buf = buf[buf.index >= buf.index[-1] - BOARD_BUFFER]
-    ss["cant_buf"] = buf
+    ss["board_buf"] = buf
     return buf
 
 
-def board_counts(buf: pd.DataFrame, now: pd.Timestamp, thresh: float) -> dict:
+def board_counts(buf: pd.DataFrame, now: pd.Timestamp, rake_thresh: float) -> dict:
     """Movements left on each board inside the rolling minute.
 
-    The window is anchored to the wall clock, not to the newest sample: a
-    movement made 61 s ago has aged out whether or not the feed is keeping up.
-    Feed lag shows in `age` instead, where it can be seen.
+    Counts cant and rake together: whichever axis the crew is using, moving the
+    board is moving the board. The window is anchored to the wall clock, not to
+    the newest sample -- a movement made 61 s ago has aged out whether or not
+    the feed is keeping up. Feed lag shows in `age` instead, where it can be
+    seen.
     """
     r = {"port": None, "stbd": None, "age": None, "moves": {}}
     if buf is None or buf.empty:
         return r
     r["age"] = max((now - buf.index[-1]).total_seconds(), 0.0)
     cutoff = now - BOARD_WINDOW
-    for side, col in (("port", wd.CANT_P), ("stbd", wd.CANT_S)):
-        if col not in buf.columns:
+    sides = (("port", wd.CANT_P, wd.RAKE_P), ("stbd", wd.CANT_S, wd.RAKE_S))
+    for side, cant_col, rake_col in sides:
+        axes, seen = [], False
+        for col, thresh in ((cant_col, BOARD_CANT_THRESH), (rake_col, rake_thresh)):
+            if col not in buf.columns:
+                continue
+            v = buf[col].dropna()
+            if v.empty:
+                continue
+            seen = True
+            axes.append(board_movements(v, thresh))
+        if not seen:
             continue
-        v = buf[col].dropna()
-        if v.empty:
-            continue
-        used = [t for t in board_movements(v, thresh) if t > cutoff]
+        used = [t for t in merge_movements(*axes, within=BOARD_MERGE) if t > cutoff]
         r["moves"][side] = len(used)
         r[side] = BOARD_LIMIT - len(used)
     return r
@@ -562,7 +576,7 @@ ss.setdefault("wall", None)       # wall-clock time when play was pressed
 ss.setdefault("range_at", None)   # when the 30 min range window last refreshed
 ss.setdefault("range_twd", None)
 ss.setdefault("range_tws", None)
-ss.setdefault("cant_buf", None)   # rolling daggerboard trace
+ss.setdefault("board_buf", None)  # rolling daggerboard trace
 ss.setdefault("wind_bits", [])    # status from the slow fragment, drawn by the fast one
 
 mode = st.segmented_control("Mode", ["Live", "Replay"], default=ss["mode"],
@@ -594,12 +608,13 @@ if mode == "Replay":
 with st.expander("Settings"):
     sma_min = st.slider("Course average (minutes)", 1, 20, 10, key="sma")
     board_thresh = st.slider(
-        "Board movement threshold (% of stroke)", 2.0, 20.0,
-        BOARD_THRESH_DEFAULT, 0.5, key="bthresh",
-        help="Travel that counts as one movement. Noise with the board parked "
-             "measures under 3%; real legs run from about 5% to 100% with no "
-             "natural gap, so where to draw the line is a rule call. Lower "
-             "counts more movements and warns earlier.")
+        "Board rake movement threshold (deg)", 1.0, 8.0,
+        BOARD_RAKE_THRESH_DEFAULT, 0.5, key="bthresh",
+        help="Rake travel that counts as one movement -- the axis that gets "
+             "pumped in light air. Measured, light-air pumping runs 6-8 deg a "
+             "leg while the flight controller's trimming when foiling runs "
+             "1-2 deg, so 4 deg counts the first and not the second. Cant is "
+             "counted alongside it at a fixed 12% of stroke.")
 sma = pd.Timedelta(minutes=sma_min)
 
 
@@ -645,7 +660,7 @@ def draw_boards():
         buf = board_buffer(now)
     else:
         now = virtual_now()
-        buf = _upto(_replay_cant(now.floor(REPLAY_BLOCK)), now)
+        buf = _upto(_replay_board(now.floor(REPLAY_BLOCK)), now)
 
     counts = board_counts(buf, now, board_thresh)
     st.markdown(render_boards(counts)
