@@ -1,7 +1,8 @@
 # Live Wind Widget
 
-Course wind and NZL boat trim at a glance for SailGP racing. A compact panel,
-designed to be shrunk into the corner of a screen and left running. No login.
+Course wind, NZL boat trim, and daggerboard cycling at a glance for SailGP
+racing. A compact panel, designed to be shrunk into the corner of a screen and
+left running. No login.
 
 ```bash
 pip install -r requirements.txt
@@ -89,6 +90,72 @@ the boat is not racing. Thresholds are named constants at the top of `app.py`.
 
 Tiles read `—` whenever their channel has no data, exactly like the wind tiles.
 
+## Board cycling
+
+More than six daggerboard movements inside a rolling minute is a penalty, so
+these two tiles count down what is left rather than up what has been used:
+**Available Port** (red) and **Available Stbd** (green), from 6 down through 0
+and into negative numbers once the limit is passed. Movements age out
+individually as they fall out of the 60-second window, so the count climbs back
+one at a time.
+
+### Counting a movement
+
+From `CANT_POS_PCT_P_pct` / `_S_pct` — measured cant position as a percentage
+of full stroke, sampled at 10 Hz. `wind_math.board_movements` walks the trace
+holding the extreme reached since the last pivot, and treats a reversal of
+`BOARD_THRESH` away from it as a new movement. Each leg counts once, so a
+part-way lift and its return are two movements, exactly as the rule reads.
+
+The movement is recorded the instant the travel is confirmed, not when the leg
+finishes — the count has to lead the sailors, not trail them.
+
+**The threshold is a rule call, not a signal-processing one.** Measured over
+the 2026-07-26 session: with a board genuinely parked the trace is flat to
+0.03–3% peak to peak, so noise and settling against the stop are easy to reject.
+But real legs run from about 5% to a full 100% of stroke in a smooth continuum
+with no natural gap, and the small ones sit mid-stroke rather than at the ends.
+So where the line falls changes the count:
+
+| Threshold | Movements in 2 h (port/stbd) | Minutes over the limit |
+|---|---|---|
+| 5% (default) | 97 / 87 | 8 / 7 |
+| 8% | 79 / 75 | 5 / 2 |
+| 12% | 63 / 63 | 0 / 0 |
+
+The default sits just above the noise floor and errs towards counting:
+over-counting costs a cautious call, under-counting costs a penalty. It is a
+slider in Settings so it can be tuned between sessions.
+
+### Keeping it live
+
+This is the one metric where lag costs something, so it is built differently
+from the rest of the widget:
+
+- **Its own 1-second fragment.** It redraws on a separate timer and never waits
+  on the wind queries.
+- **One pooled InfluxDB connection.** Opening a client per query costs a TLS
+  handshake — measured at 3.2 s against 1.3 s on a reused connection. The
+  connection is now shared by every query in the app, which is why the 30-minute
+  range query dropped from 13.8 s to 1.4 s.
+- **Incremental fetch.** A rolling 150-second trace is held in session state and
+  extended with only the samples that arrived since the last one, typically
+  about a second's worth. A tick costs ~0.28 s of query and ~5 ms of counting.
+  If the buffer falls more than 20 s behind it is refilled outright rather than
+  spliced across a hole.
+
+The rolling window is anchored to the wall clock, not to the newest sample: a
+movement made 61 s ago has aged out whether or not the feed is keeping up. Feed
+lag shows in the status line instead, as `boards 0.4s`, which turns amber past
+3 s — a stale counter is worse than no counter, so it has to be visible. That
+figure assumes the machine clock is synced.
+
+## Replay clock
+
+In replay the status line shows the virtual clock to the second, in bold, and
+ticks once a second so it can be lined up against other apps. Live mode still
+shows the timestamp of the newest data instead.
+
 ## Modes
 
 **Live** — queries InfluxDB every 3 s with no caching or buffering, so the
@@ -143,6 +210,7 @@ InfluxDB at `data.sailgp.tech`, bucket `sailgp`. Mark data is at `level ==
 | `ANGLE_CA1_deg` / `CAMBER_INPUT_deg` | strm | Camber and its demand |
 | `BTN_WT_P_CAMBER_ZERO` / `BTN_WT_S_CAMBER_ZERO` | strm | Camber-zero buttons |
 | `GPS_SOG_km_h_1` / `RATE_YAW_deg_s_1` | strm | Not displayed — they gate the alarms |
+| `CANT_POS_PCT_P_pct` / `CANT_POS_PCT_S_pct` | strm | Daggerboard cant, % of stroke, 10 Hz |
 
 Marks: `WG1`/`WG2` (windward gate), `LG1`/`LG2` (leeward gate), `M1`,
 `SL1`/`SL2` (committee boat / pin).
@@ -188,9 +256,11 @@ only and contains live credentials.
 | File | Role |
 |---|---|
 | `app.py` | UI, layout, metrics, alarm rules, mode control, refresh timing |
-| `wind_data.py` | InfluxDB queries, mark and boat channel constants |
-| `wind_math.py` | Circular statistics, dwell filtering, course geometry, colour ramp |
+| `wind_data.py` | InfluxDB queries, pooled client, mark and boat channel constants |
+| `wind_math.py` | Circular statistics, dwell filtering, board detection, geometry, colour ramp |
 | `config.py` | Credentials |
 
 Each poll runs its queries concurrently (`wind_data.parallel`), so the cycle
-costs about as long as its slowest query rather than their sum.
+costs about as long as its slowest query rather than their sum. Two fragments
+drive the page on separate timers: wind and trim on the slow one, board cycling
+on its own 1-second tick.

@@ -144,6 +144,45 @@ def held(flag: pd.Series, dwell: pd.Timedelta) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Board movement detection
+# ---------------------------------------------------------------------------
+
+def board_movements(v: pd.Series, thresh: float) -> list:
+    """Timestamps at which the board is confirmed to have begun a new leg.
+
+    A zigzag over the cant trace: hold the extreme reached since the last
+    pivot, and treat a reversal of `thresh` away from it as a new movement.
+    Travel below the threshold never registers, which is what keeps sensor
+    noise and the board settling against its stop from counting -- and a
+    partial cycle that does exceed it counts in full, because under the rule
+    a half-height lift and its return are still two movements.
+
+    The movement is recorded the instant the travel is confirmed, not when the
+    leg finishes, so the count leads the sailors rather than trailing them.
+    """
+    if v.empty:
+        return []
+    x = v.to_numpy(dtype=float)
+    t = list(v.index)
+    out = []
+    direction = 0            # +1 rising, -1 falling, 0 not yet established
+    hi = lo = x[0]           # extremes since the last confirmed pivot
+    for i in range(1, len(x)):
+        xi = x[i]
+        if np.isnan(xi):
+            continue
+        if xi > hi:
+            hi = xi
+        if xi < lo:
+            lo = xi
+        if direction != -1 and hi - xi >= thresh:
+            out.append(t[i]); direction = -1; hi = lo = xi
+        elif direction != 1 and xi - lo >= thresh:
+            out.append(t[i]); direction = 1; hi = lo = xi
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Course geometry
 # ---------------------------------------------------------------------------
 

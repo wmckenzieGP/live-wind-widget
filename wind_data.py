@@ -11,6 +11,7 @@ the wind sits near 0/360. TWS is scalar, so `mean` is fine.
 """
 from __future__ import annotations
 
+import atexit
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 
@@ -52,17 +53,52 @@ YAW_RATE = "RATE_YAW_deg_s_1"
 
 BOAT_ANALOG = [RUD_AVG, RUD_DIFF, PITCH, CAMBER, CAMBER_TARGET, SOG, YAW_RATE]
 
+# Daggerboard cant position, as a percentage of full stroke. Sampled at 10 Hz
+# and used only by the cycling counter, which needs its own fast path.
+CANT_P = "CANT_POS_PCT_P_pct"
+CANT_S = "CANT_POS_PCT_S_pct"
+
 # Below this gate-to-gate separation the marks are stowed, not deployed,
 # and the course axis is meaningless.
 DEPLOYED_MIN_SEPARATION_M = 300.0
 
 
+# One client, held open and reused. Building a fresh one per query costs a TLS
+# handshake every time -- measured at 3.2 s against 1.3 s reusing a connection,
+# which the board counter cannot afford.
+_CLIENT: InfluxDBClient | None = None
+
+
 def _client() -> InfluxDBClient:
-    return InfluxDBClient(url=URL, token=TOKEN, org=ORG_ID, timeout=60_000)
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = InfluxDBClient(url=URL, token=TOKEN, org=ORG_ID, timeout=60_000)
+    return _CLIENT
+
+
+def _reset_client() -> None:
+    global _CLIENT
+    try:
+        if _CLIENT is not None:
+            _CLIENT.close()
+    except Exception:
+        pass
+    _CLIENT = None
+
+
+# Close on the way out, while the modules the client needs are still alive --
+# left to __del__ during interpreter teardown it raises on a half-torn-down
+# module and prints an ignored-exception traceback.
+atexit.register(_reset_client)
 
 
 def _fmt(dt) -> str:
     return arrow.get(dt).to("UTC").format("YYYY-MM-DDTHH:mm:ss") + "Z"
+
+
+def _fmt_ns(dt) -> str:
+    """Sub-second precision, for resuming a stream exactly where it left off."""
+    return arrow.get(dt).to("UTC").format("YYYY-MM-DDTHH:mm:ss.SSS") + "Z"
 
 
 def _mark_filter(marks: list[str]) -> str:
@@ -70,8 +106,13 @@ def _mark_filter(marks: list[str]) -> str:
 
 
 def _query(flux: str) -> pd.DataFrame:
-    with _client() as c:
-        df = c.query_api().query_data_frame(org=ORG_ID, query=flux)
+    try:
+        df = _client().query_api().query_data_frame(org=ORG_ID, query=flux)
+    except Exception:
+        # A pooled connection can go stale between races. Rebuild once and
+        # retry rather than surfacing a transport error as missing data.
+        _reset_client()
+        df = _client().query_api().query_data_frame(org=ORG_ID, query=flux)
     if isinstance(df, list):
         parts = [d for d in df if d is not None and not d.empty]
         df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
@@ -167,6 +208,57 @@ union(tables: [analog, buttons])
     out.index.name = "time"
     out.columns.name = None
     return out.sort_index()
+
+
+# ---------------------------------------------------------------------------
+# Daggerboard cant
+#
+# The cycling counter is the one metric that must not lag, so this is kept as
+# narrow as it can be: two channels, no joins, decimated server-side, and
+# normally fetched as a one-second delta onto a buffer the caller already holds.
+# ---------------------------------------------------------------------------
+
+CANT_EVERY = "200ms"        # far finer than a board movement needs
+
+
+def _cant_flux(range_expr: str) -> str:
+    return f"""
+from(bucket: "{BUCKET}")
+  |> range({range_expr})
+  |> filter(fn: (r) => r["_measurement"] == "{CANT_P}" or r["_measurement"] == "{CANT_S}")
+  |> filter(fn: (r) => r["_field"] == "value")
+  |> filter(fn: (r) => r["level"] == "strm")
+  |> filter(fn: (r) => r["boat"] == "{BOAT}")
+  |> aggregateWindow(every: {CANT_EVERY}, fn: last, createEmpty: false)
+  |> keep(columns: ["_time", "_value", "_measurement"])
+"""
+
+
+def _cant_frame(flux: str) -> pd.DataFrame:
+    df = _query(flux)
+    if df.empty or "_measurement" not in df.columns:
+        return pd.DataFrame()
+    df["_time"] = _naive_utc(df["_time"])
+    out = df.pivot_table(index="_time", columns="_measurement", values="_value")
+    out.index.name = "time"
+    out.columns.name = None
+    return out.sort_index()
+
+
+def fetch_cant_recent(window: pd.Timedelta) -> pd.DataFrame:
+    """Backfill: the trailing `window`, relative to server time so no client
+    clock skew creeps in."""
+    return _cant_frame(_cant_flux(f"start: -{int(window.total_seconds())}s"))
+
+
+def fetch_cant_since(after: pd.Timestamp) -> pd.DataFrame:
+    """The steady-state call -- only what has arrived since the last sample."""
+    return _cant_frame(_cant_flux(f"start: {_fmt_ns(after)}"))
+
+
+def fetch_cant_range(start, end) -> pd.DataFrame:
+    """Explicit window, for replay."""
+    return _cant_frame(_cant_flux(f"start: {_fmt(start)}, stop: {_fmt(end)}"))
 
 
 # ---------------------------------------------------------------------------
