@@ -1,6 +1,7 @@
-influxdb-client==1.50.0
 numpy==2.4.2
 pandas==2.3.3
 python-dotenv==1.2.1
 streamlit==1.54.0
 arrow==1.4.0
+psycopg2-binary==2.9.11
+certifi==2026.1.4

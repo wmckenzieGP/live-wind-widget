@@ -1,7 +1,7 @@
-"""InfluxDB access for SailGP course mark wind and positions.
+"""TimescaleDB access for SailGP course mark wind and positions.
 
-All mark data lives in the `sailgp` bucket at level "mdss", with the mark name
-carried in the `boat` tag. Marks sample at 5 Hz, so queries downsample to 1 s
+All mark data lives in `sgp_telemetry` at level "mdss", with the mark name
+carried in the `boat` column. Marks sample at 5 Hz, so queries downsample to 1 s
 server-side -- far finer than the 20 s EMA or 10 min SMA need, and ~10x less
 data over the wire.
 
@@ -12,17 +12,12 @@ the wind sits near 0/360. TWS is scalar, so `mean` is fine.
 from __future__ import annotations
 
 import atexit
-import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 import arrow
 import pandas as pd
-from influxdb_client import InfluxDBClient
-from influxdb_client.client.warnings import MissingPivotFunction
 
-from config import BUCKET, ORG_ID, TOKEN, URL
-
-warnings.simplefilter("ignore", MissingPivotFunction)
+from tsdb_client import TSDBClient
 
 TOP_MARKS = ["WG1", "WG2"]        # windward gate
 BOTTOM_MARKS = ["LG1", "LG2"]     # leeward gate
@@ -66,16 +61,18 @@ BOARD_CHANNELS = [HEIGHT_P, HEIGHT_S]
 DEPLOYED_MIN_SEPARATION_M = 300.0
 
 
-# One client, held open and reused. Building a fresh one per query costs a TLS
-# handshake every time -- measured at 3.2 s against 1.3 s reusing a connection,
-# which the board counter cannot afford.
-_CLIENT: InfluxDBClient | None = None
+# A pool of warm connections, not one shared connection. Each new connection
+# costs a TLS handshake -- measured at 3.3 s against 1.0 s reusing one, which
+# the board counter cannot afford -- but `parallel()` runs several fetches at
+# once and a psycopg2 connection is not thread-safe. The pool gives both.
+_CLIENT: TSDBClient | None = None
+_POOL_SIZE = 6          # comfortably above the widest parallel() fan-out
 
 
-def _client() -> InfluxDBClient:
+def _client() -> TSDBClient:
     global _CLIENT
     if _CLIENT is None:
-        _CLIENT = InfluxDBClient(url=URL, token=TOKEN, org=ORG_ID, timeout=60_000)
+        _CLIENT = TSDBClient(level="mdss", pool_size=_POOL_SIZE)
     return _CLIENT
 
 
@@ -104,27 +101,20 @@ def _fmt_ns(dt) -> str:
     return arrow.get(dt).to("UTC").format("YYYY-MM-DDTHH:mm:ss.SSS") + "Z"
 
 
-def _mark_filter(marks: list[str]) -> str:
-    return " or ".join(f'r["boat"] == "{m}"' for m in marks)
-
-
-def _query(flux: str) -> pd.DataFrame:
-    try:
-        df = _client().query_api().query_data_frame(org=ORG_ID, query=flux)
-    except Exception:
-        # A pooled connection can go stale between races. Rebuild once and
-        # retry rather than surfacing a transport error as missing data.
-        _reset_client()
-        df = _client().query_api().query_data_frame(org=ORG_ID, query=flux)
-    if isinstance(df, list):
-        parts = [d for d in df if d is not None and not d.empty]
-        df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-    return df if df is not None else pd.DataFrame()
-
-
 def _naive_utc(s: pd.Series) -> pd.Series:
     s = pd.to_datetime(s, utc=True)
     return s.dt.tz_localize(None)
+
+
+def _indexed(df: pd.DataFrame) -> pd.DataFrame:
+    """Bucket column -> naive UTC index named `time`, sorted."""
+    if df.empty or "_time" not in df.columns:
+        return pd.DataFrame()
+    out = df.copy()
+    out["_time"] = _naive_utc(out["_time"])
+    out = out.set_index("_time").sort_index()
+    out.index.name = "time"
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -135,38 +125,26 @@ def fetch_wind(start, end, marks: list[str] | None = None) -> tuple[pd.DataFrame
     """Return (twd, tws) frames at 1 s resolution, indexed by UTC time with one
     column per mark. Missing marks simply don't appear as columns."""
     marks = marks or ALL_MARKS
-    mf = _mark_filter(marks)
-    flux = f"""
-twd = from(bucket: "{BUCKET}")
-  |> range(start: {_fmt(start)}, stop: {_fmt(end)})
-  |> filter(fn: (r) => r["_measurement"] == "{TWD}")
-  |> filter(fn: (r) => r["_field"] == "value")
-  |> filter(fn: (r) => r["level"] == "mdss")
-  |> filter(fn: (r) => {mf})
-  |> aggregateWindow(every: 1s, fn: last, createEmpty: false)
-
-tws = from(bucket: "{BUCKET}")
-  |> range(start: {_fmt(start)}, stop: {_fmt(end)})
-  |> filter(fn: (r) => r["_measurement"] == "{TWS}")
-  |> filter(fn: (r) => r["_field"] == "value")
-  |> filter(fn: (r) => r["level"] == "mdss")
-  |> filter(fn: (r) => {mf})
-  |> aggregateWindow(every: 1s, fn: mean, createEmpty: false)
-
-union(tables: [twd, tws])
-  |> keep(columns: ["_time", "_value", "boat", "_measurement"])
-"""
-    df = _query(flux)
-    if df.empty or "_measurement" not in df.columns:
+    # Both channels for every mark in ONE scan. TWD takes the last sample of
+    # each second (circular-safe); TWS averages.
+    df = _client().fetch_pivot_multi(
+        boats=marks,
+        channels=[TWD, TWS],
+        start=_fmt(start),
+        stop=_fmt(end),
+        bucket="1 second",
+        level="mdss",
+        aggs={TWD: "last", TWS: "avg"},
+    )
+    if df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
     df["_time"] = _naive_utc(df["_time"])
 
-    def _pivot(measurement: str) -> pd.DataFrame:
-        sub = df[df["_measurement"] == measurement]
-        if sub.empty:
+    def _pivot(channel: str) -> pd.DataFrame:
+        if channel not in df.columns:
             return pd.DataFrame()
-        out = sub.pivot_table(index="_time", columns="boat", values="_value")
+        out = df.pivot_table(index="_time", columns="boat", values=channel)
         out.index.name = "time"
         out.columns.name = None
         return out.sort_index()
@@ -184,33 +162,19 @@ def fetch_boat(start, end, boat: str = BOAT) -> pd.DataFrame:
     Analogue channels decimate with `last`; the camber-zero buttons use `max`
     so a press shorter than a second still shows up.
     """
-    def _stream(measurements: list[str], fn: str) -> str:
-        mf = " or ".join(f'r["_measurement"] == "{m}"' for m in measurements)
-        return f"""from(bucket: "{BUCKET}")
-  |> range(start: {_fmt(start)}, stop: {_fmt(end)})
-  |> filter(fn: (r) => r["_field"] == "value")
-  |> filter(fn: (r) => r["level"] == "strm")
-  |> filter(fn: (r) => r["boat"] == "{boat}")
-  |> filter(fn: (r) => {mf})
-  |> aggregateWindow(every: 1s, fn: {fn}, createEmpty: false)"""
+    aggs = {c: "last" for c in BOAT_ANALOG}
+    aggs.update({c: "max" for c in CAMBER_ZERO})
 
-    flux = f"""
-analog = {_stream(BOAT_ANALOG, "last")}
-
-buttons = {_stream(CAMBER_ZERO, "max")}
-
-union(tables: [analog, buttons])
-  |> keep(columns: ["_time", "_value", "_measurement"])
-"""
-    df = _query(flux)
-    if df.empty or "_measurement" not in df.columns:
-        return pd.DataFrame()
-
-    df["_time"] = _naive_utc(df["_time"])
-    out = df.pivot_table(index="_time", columns="_measurement", values="_value")
-    out.index.name = "time"
-    out.columns.name = None
-    return out.sort_index()
+    df = _client().fetch_pivot(
+        boat=boat,
+        channels=BOAT_ANALOG + CAMBER_ZERO,
+        start=_fmt(start),
+        stop=_fmt(end),
+        bucket="1 second",
+        level="strm",
+        aggs=aggs,
+    )
+    return _indexed(df)
 
 
 # ---------------------------------------------------------------------------
@@ -221,48 +185,55 @@ union(tables: [analog, buttons])
 # normally fetched as a one-second delta onto a buffer the caller already holds.
 # ---------------------------------------------------------------------------
 
-BOARD_EVERY = "200ms"       # far finer than a board movement needs
+BOARD_EVERY = "200 milliseconds"    # far finer than a board movement needs
+
+# Written out rather than routed through fetch_pivot so the trailing-window
+# variant can bound time with the SERVER's clock (now() - interval). Bounding
+# it by the client clock would silently drop or duplicate samples whenever the
+# laptop's time drifts from the database's.
+_BOARD_SELECT = ",\n".join(
+    f"    last(value, time) FILTER (WHERE channel = '{c}') AS \"{c}\""
+    for c in BOARD_CHANNELS
+)
 
 
-def _board_flux(range_expr: str) -> str:
-    mf = " or ".join(f'r["_measurement"] == "{m}"' for m in BOARD_CHANNELS)
-    return f"""
-from(bucket: "{BUCKET}")
-  |> range({range_expr})
-  |> filter(fn: (r) => {mf})
-  |> filter(fn: (r) => r["_field"] == "value")
-  |> filter(fn: (r) => r["level"] == "strm")
-  |> filter(fn: (r) => r["boat"] == "{BOAT}")
-  |> aggregateWindow(every: {BOARD_EVERY}, fn: last, createEmpty: false)
-  |> keep(columns: ["_time", "_value", "_measurement"])
+def _board_frame(where: str, params: dict) -> pd.DataFrame:
+    sql = f"""
+SELECT
+    time_bucket('{BOARD_EVERY}', time) AS "_time",
+{_BOARD_SELECT}
+FROM sgp_telemetry
+WHERE boat = %(boat)s
+  AND level = 'strm'
+  AND channel = ANY(%(channels)s)
+  AND {where}
+GROUP BY 1
+ORDER BY 1;
 """
-
-
-def _board_frame(flux: str) -> pd.DataFrame:
-    df = _query(flux)
-    if df.empty or "_measurement" not in df.columns:
-        return pd.DataFrame()
-    df["_time"] = _naive_utc(df["_time"])
-    out = df.pivot_table(index="_time", columns="_measurement", values="_value")
-    out.index.name = "time"
-    out.columns.name = None
-    return out.sort_index()
+    df = _client().query(sql, {"boat": BOAT, "channels": BOARD_CHANNELS, **params})
+    return _indexed(df)
 
 
 def fetch_board_recent(window: pd.Timedelta) -> pd.DataFrame:
     """Backfill: the trailing `window`, relative to server time so no client
     clock skew creeps in."""
-    return _board_frame(_board_flux(f"start: -{int(window.total_seconds())}s"))
+    return _board_frame(
+        "time >= now() - %(lookback)s::interval",
+        {"lookback": f"{int(window.total_seconds())} seconds"},
+    )
 
 
 def fetch_board_since(after: pd.Timestamp) -> pd.DataFrame:
     """The steady-state call -- only what has arrived since the last sample."""
-    return _board_frame(_board_flux(f"start: {_fmt_ns(after)}"))
+    return _board_frame("time >= %(after)s", {"after": _fmt_ns(after)})
 
 
 def fetch_board_range(start, end) -> pd.DataFrame:
     """Explicit window, for replay."""
-    return _board_frame(_board_flux(f"start: {_fmt(start)}, stop: {_fmt(end)}"))
+    return _board_frame(
+        "time >= %(start)s AND time < %(stop)s",
+        {"start": _fmt(start), "stop": _fmt(end)},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -272,21 +243,19 @@ def fetch_board_range(start, end) -> pd.DataFrame:
 def fetch_positions(start, end, marks: list[str] | None = None) -> dict[str, tuple[float, float]]:
     """Latest known (lat, lon) per mark within the window."""
     marks = marks or ALL_MARKS
-    flux = f"""
-from(bucket: "{BUCKET}")
-  |> range(start: {_fmt(start)}, stop: {_fmt(end)})
-  |> filter(fn: (r) => r["_measurement"] == "{LAT}" or r["_measurement"] == "{LON}")
-  |> filter(fn: (r) => r["_field"] == "value")
-  |> filter(fn: (r) => r["level"] == "mdss")
-  |> filter(fn: (r) => {_mark_filter(marks)})
-  |> last()
-  |> keep(columns: ["boat", "_measurement", "_value"])
-"""
-    df = _query(flux)
-    if df.empty or "_measurement" not in df.columns:
+    # Latest sample per (mark, coordinate) WITHIN the window. The bound is the
+    # point: unbounded, a mark that stopped reporting last event still returns
+    # its old position, which reads as current.
+    df = _client().fetch_latest(
+        [(m, ch) for m in marks for ch in (LAT, LON)],
+        level="mdss",
+        start=_fmt(start),
+        stop=_fmt(end),
+    )
+    if df.empty or "channel" not in df.columns:
         return {}
 
-    wide = df.pivot_table(index="boat", columns="_measurement", values="_value")
+    wide = df.pivot_table(index="boat", columns="channel", values="value")
     if LAT not in wide.columns or LON not in wide.columns:
         return {}
 
@@ -317,17 +286,25 @@ def parallel(*calls):
 
 
 def latest_data_time():
-    """Most recent mark timestamp in the bucket, or None. Used to tell whether
-    anything is streaming live right now."""
-    df = _query(f"""
-from(bucket: "{BUCKET}")
-  |> range(start: -30d)
-  |> filter(fn: (r) => r["_measurement"] == "{TWD}")
-  |> filter(fn: (r) => r["_field"] == "value")
-  |> filter(fn: (r) => r["level"] == "mdss")
-  |> last()
-  |> keep(columns: ["_time"])
-""")
-    if df.empty or "_time" not in df.columns:
+    """Most recent mark timestamp, or None. Used to tell whether anything is
+    streaming live right now.
+
+    One indexed lookup per mark (ORDER BY time DESC LIMIT 1), bounded to the
+    last 30 days. `max(time)` would scan instead of using the index.
+    """
+    df = _client().query(
+        """
+        SELECT max(t.time) AS latest
+        FROM unnest(%(marks)s::text[]) AS m(boat)
+        CROSS JOIN LATERAL (
+            SELECT time FROM sgp_telemetry
+            WHERE boat = m.boat AND channel = %(channel)s AND level = 'mdss'
+              AND time >= now() - INTERVAL '30 days'
+            ORDER BY time DESC LIMIT 1
+        ) t
+        """,
+        {"marks": ALL_MARKS, "channel": TWD},
+    )
+    if df.empty or df["latest"].isna().all():
         return None
-    return _naive_utc(df["_time"]).max()
+    return _naive_utc(df["latest"]).max()

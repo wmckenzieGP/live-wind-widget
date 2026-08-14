@@ -147,10 +147,11 @@ from the rest of the widget:
 
 - **Its own 1-second fragment.** It redraws on a separate timer and never waits
   on the wind queries.
-- **One pooled InfluxDB connection.** Opening a client per query costs a TLS
-  handshake — measured at 3.2 s against 1.3 s on a reused connection. The
-  connection is now shared by every query in the app, which is why the 30-minute
-  range query dropped from 13.8 s to 1.4 s.
+- **A pool of warm TimescaleDB connections.** Opening a connection per query
+  costs a TLS handshake — measured at 3.3 s against 1.0 s on a reused one. The
+  pool (`TSDBClient(pool_size=6)`) is shared by every query in the app. It is a
+  pool rather than a single shared connection because `parallel()` runs several
+  fetches at once and a psycopg2 connection is not thread-safe.
 - **Incremental fetch.** A rolling 150-second trace is held in session state and
   extended with only the samples that arrived since the last one, typically
   about a second's worth. A tick costs ~0.28 s of query and ~6 ms of counting.
@@ -171,7 +172,7 @@ shows the timestamp of the newest data instead.
 
 ## Modes
 
-**Live** — queries InfluxDB every 3 s with no caching or buffering, so the
+**Live** — queries TimescaleDB every 3 s with no caching or buffering, so the
 leading edge is always current. Each poll re-reads the whole trailing window,
 which is stateless and cannot drift or gap.
 
@@ -210,10 +211,11 @@ Streamlit Cloud sleeps idle apps, so the first load after a quiet spell takes
 
 ## Data source
 
-InfluxDB at `data.sailgp.tech`, bucket `sailgp`. Mark data is at `level ==
-"mdss"`, boat data at `level == "strm"`, both with the name in the `boat` tag.
+TimescaleDB at `tsdb.sailgp.tech:5432`, table `sgp_telemetry`, over mutual TLS.
+Mark data is at `level == 'mdss'`, boat data at `level == 'strm'`, both with the
+name in the `boat` column.
 
-| Measurement | Level | Notes |
+| Channel | Level | Notes |
 |---|---|---|
 | `TWD_MDSS_deg` | mdss | Wind direction |
 | `TWS_MDSS_km_h_1` | mdss | Wind speed, km/h |
@@ -256,12 +258,21 @@ Credentials come from Streamlit Cloud secrets in production, falling back to a
 local `.env`:
 
 ```
-ORG_ID=…
-TOKEN=…
-URL=https://data.sailgp.tech
+TSDB_HOST=tsdb.sailgp.tech
+TSDB_PORT=5432
+TSDB_DB=sailgp
+TSDB_USER=sailgp_team_nzl
+TSDB_PASSWORD=…
+TSDB_SSLCERT=client.crt
+TSDB_SSLKEY=client.key
 ```
 
-`.env` is gitignored. So is `Start Timing App/` — that folder is reference code
+The connection also needs the client certificate pair `client.crt`/`client.key`,
+split from the team `.p12` bundle. On Streamlit Cloud they travel as PEM text in
+the secrets vault instead (`python generate_tsdb_secrets.py` produces the block).
+Certificate expires 2027-08-12.
+
+`.env`, `client.crt` and `client.key` are gitignored. So is `Start Timing App/` — that folder is reference code
 only and contains live credentials.
 
 ## Files
@@ -269,9 +280,10 @@ only and contains live credentials.
 | File | Role |
 |---|---|
 | `app.py` | UI, layout, metrics, alarm rules, mode control, refresh timing |
-| `wind_data.py` | InfluxDB queries, pooled client, mark and boat channel constants |
+| `wind_data.py` | TimescaleDB queries, pooled client, mark and boat channel constants |
 | `wind_math.py` | Circular statistics, dwell filtering, board movement detection, geometry, colour ramp |
-| `config.py` | Credentials |
+| `tsdb_config.py` | Credentials and TLS material (shared migration kit) |
+| `tsdb_client.py` / `pivot_template.sql` | Query layer: pooled connections, pivots, latest-value lookups (shared migration kit) |
 
 Each poll runs its queries concurrently (`wind_data.parallel`), so the cycle
 costs about as long as its slowest query rather than their sum. Two fragments

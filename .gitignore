@@ -15,3 +15,9 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# TimescaleDB client certificates - credentials, never commit
+*.p12
+client.crt
+client.key
+*.cer
