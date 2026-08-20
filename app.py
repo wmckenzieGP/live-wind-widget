@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import datetime as dt
 import time
-from html import escape
 
 import pandas as pd
 import streamlit as st
@@ -125,8 +124,6 @@ st.markdown("""
   }
   .status {font-size: 10px; color: #7b8189; text-align: center;
            padding: 5px 0 0; line-height: 1.5;}
-  .diag {font-size: 9.5px; color: #a8500f; text-align: center; padding: 3px 2px 0;
-         line-height: 1.45; word-break: break-word;}
   .clock {font-size: 12px; font-weight: 700; color: #3d4349;
           font-variant-numeric: tabular-nums; letter-spacing: .02em;}
   .warn {color: #a8500f; font-weight: 600;}
@@ -718,9 +715,16 @@ def feed_bits() -> list[str]:
     return [] if ss["feed_at"] is None else ["<span class='warn'>connection lost</span>"]
 
 
-def feed_diag() -> str:
-    """What the database actually said, under the status line."""
-    return "" if not ss["feed_msg"] else f"<div class='diag'>{escape(ss['feed_msg'])}</div>"
+def feed_diag() -> None:
+    """What the database actually said, at the top of the widget.
+
+    A red box rather than a line of small print, and st.code so it can be
+    copied out in one click: a message nobody can find is the same as no
+    message, which is how this started.
+    """
+    if ss["feed_msg"]:
+        st.error("Database connection failed")
+        st.code(ss["feed_msg"], language=None)
 
 
 def blank_wind() -> str:
@@ -757,6 +761,10 @@ def draw():
         except wd.FEED_ERRORS as e:
             feed_failed(e)
 
+    # Called here rather than at the top so it reflects this tick, and still
+    # lands above the tiles -- Streamlit draws in call order.
+    feed_diag()
+
     # Whatever happened, put a frame up -- the last good one if there is one.
     # The wind bits keep the timestamp it was current at, so a held frame is
     # never mistaken for a live one.
@@ -785,8 +793,7 @@ def draw_boards():
     bits = list(ss["wind_bits"])
     bits.append(ss["board_bit"] or board_age_bit({}))
     st.markdown((ss["board_html"] or render_boards({}))
-                + status_line(bits + feed_bits()) + feed_diag(),
-                unsafe_allow_html=True)
+                + status_line(bits + feed_bits()), unsafe_allow_html=True)
 
 
 def live_range(now: pd.Timestamp, r: dict) -> dict:
