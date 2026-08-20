@@ -1,11 +1,11 @@
 """Live Wind Widget -- SailGP course wind at a glance.
 
-Seven metrics, designed to be shrunk into the corner of a screen and left
-running. No login.
+Course wind, boat trim and board cycling, designed to be shrunk into the corner
+of a screen and left running. No login.
 
-Live mode queries InfluxDB every 3 s with no buffering, so the leading edge is
-always current. Replay mode prefetches in blocks and advances a virtual clock
-at normal speed, driving the identical calculation path.
+Live mode queries TimescaleDB every 3 s with no buffering, so the leading edge
+is always current. Replay mode prefetches in blocks and advances a virtual
+clock at normal speed, driving the identical calculation path.
 """
 from __future__ import annotations
 
