@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as dt
 import time
+from html import escape
 
 import pandas as pd
 import streamlit as st
@@ -124,6 +125,8 @@ st.markdown("""
   }
   .status {font-size: 10px; color: #7b8189; text-align: center;
            padding: 5px 0 0; line-height: 1.5;}
+  .diag {font-size: 9.5px; color: #a8500f; text-align: center; padding: 3px 2px 0;
+         line-height: 1.45; word-break: break-word;}
   .clock {font-size: 12px; font-weight: 700; color: #3d4349;
           font-variant-numeric: tabular-nums; letter-spacing: .02em;}
   .warn {color: #a8500f; font-weight: 600;}
@@ -649,6 +652,7 @@ ss.setdefault("wind_html", None)  # last good frame, put back up if the feed dro
 ss.setdefault("board_html", None)
 ss.setdefault("board_bit", None)
 ss.setdefault("feed_at", None)    # when the feed last failed, for the back-off
+ss.setdefault("feed_msg", None)   # and what it said, shown under the status line
 
 mode = st.segmented_control("Mode", ["Live", "Replay"], default=ss["mode"],
                             key="mode_ctl", label_visibility="collapsed")
@@ -697,19 +701,26 @@ def feed_ready() -> bool:
 
 
 def feed_failed(exc: Exception) -> None:
-    """Start the back-off and let go of the pool.
+    """Start the back-off, let go of the pool, and keep what the server said.
 
-    The detail goes to the server log rather than the page: the message names
-    the role and the host, and neither belongs in a browser. On Streamlit Cloud
-    it lands in Manage app -> logs.
+    The message is shown in the widget as well as logged. It names the host and
+    the role, which is not something to put on a page indefinitely -- but a
+    deployment whose logs you cannot reach is worse, and this is the line that
+    says whether the server refused us, timed out, or never heard of us.
     """
     wd.reset_client()
     ss["feed_at"] = time.time()
-    print(f"[feed] {type(exc).__name__}: {exc}", flush=True)
+    ss["feed_msg"] = " ".join(f"{type(exc).__name__}: {exc}".split())[:300]
+    print(f"[feed] {ss['feed_msg']}", flush=True)
 
 
 def feed_bits() -> list[str]:
     return [] if ss["feed_at"] is None else ["<span class='warn'>connection lost</span>"]
+
+
+def feed_diag() -> str:
+    """What the database actually said, under the status line."""
+    return "" if not ss["feed_msg"] else f"<div class='diag'>{escape(ss['feed_msg'])}</div>"
 
 
 def blank_wind() -> str:
@@ -742,7 +753,7 @@ def draw():
             # bottom and, in replay, ticks once a second with the clock.
             ss["wind_bits"] = status_bits(r, tag, vnow, replay)
             ss["wind_html"] = render(r, rng, compute_boat(boat), sma_min)
-            ss["feed_at"] = None
+            ss["feed_at"] = ss["feed_msg"] = None
         except wd.FEED_ERRORS as e:
             feed_failed(e)
 
@@ -767,14 +778,15 @@ def draw_boards():
             counts = board_counts(buf, now)
             ss["board_html"] = render_boards(counts)
             ss["board_bit"] = board_age_bit(counts)
-            ss["feed_at"] = None
+            ss["feed_at"] = ss["feed_msg"] = None
         except wd.FEED_ERRORS as e:
             feed_failed(e)
 
     bits = list(ss["wind_bits"])
     bits.append(ss["board_bit"] or board_age_bit({}))
     st.markdown((ss["board_html"] or render_boards({}))
-                + status_line(bits + feed_bits()), unsafe_allow_html=True)
+                + status_line(bits + feed_bits()) + feed_diag(),
+                unsafe_allow_html=True)
 
 
 def live_range(now: pd.Timestamp, r: dict) -> dict:
