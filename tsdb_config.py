@@ -62,6 +62,12 @@ TSDB_PASSWORD = _get("TSDB_PASSWORD")
 # parked on a handshake that is never going to finish. The TLS handshake itself
 # measures ~3.3 s, so this leaves room for a slow one.
 TSDB_CONNECT_TIMEOUT = int(_get("TSDB_CONNECT_TIMEOUT", 10))
+# Connections the role is allowed to hold at once. The server decides this, not
+# us: past the cap the extras are refused at connect time, so asking for more
+# buys nothing and costs the first query that wants one. One is the safe floor
+# for a shared team login; raise it here or in secrets once the real cap is
+# known, without touching code.
+TSDB_MAX_CONNECTIONS = max(1, int(_get("TSDB_MAX_CONNECTIONS", 1)))
 
 _cert_pem = _get("TSDB_SSLCERT_PEM")
 _key_pem = _get("TSDB_SSLKEY_PEM")

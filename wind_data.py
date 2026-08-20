@@ -17,13 +17,16 @@ from concurrent.futures import ThreadPoolExecutor
 import arrow
 import pandas as pd
 import psycopg2
+import psycopg2.pool
 
+import tsdb_config
 from tsdb_client import TSDBClient, TSDBTimeout
 
 # "The database is not answering right now", as opposed to "that query was
 # wrong". A caller on a timer can hold its last frame through one of these and
 # try again; anything else is a bug and should surface.
-FEED_ERRORS = (psycopg2.OperationalError, psycopg2.InterfaceError, TSDBTimeout)
+FEED_ERRORS = (psycopg2.OperationalError, psycopg2.InterfaceError,
+               psycopg2.pool.PoolError, TSDBTimeout)
 
 TOP_MARKS = ["WG1", "WG2"]        # windward gate
 BOTTOM_MARKS = ["LG1", "LG2"]     # leeward gate
@@ -69,16 +72,23 @@ DEPLOYED_MIN_SEPARATION_M = 300.0
 
 # A pool of warm connections, not one shared connection. Each new connection
 # costs a TLS handshake -- measured at 3.3 s against 1.0 s reusing one, which
-# the board counter cannot afford -- but `parallel()` runs several fetches at
-# once and a psycopg2 connection is not thread-safe. The pool gives both.
+# the board counter cannot afford -- and a psycopg2 connection is not
+# thread-safe, so anything running fetches at once needs a pool rather than a
+# shared handle.
+#
+# How wide the pool goes is the server's call, not ours. A role with a
+# CONNECTION LIMIT accepts the first connection and refuses the rest, and
+# because the limit is only checked at connect time a process that is already
+# up sails on until it restarts -- which is why this surfaces on a redeploy
+# rather than when the cap is set.
 _CLIENT: TSDBClient | None = None
-_POOL_SIZE = 6          # comfortably above the widest parallel() fan-out
+MAX_CONNECTIONS = tsdb_config.TSDB_MAX_CONNECTIONS
 
 
 def _client() -> TSDBClient:
     global _CLIENT
     if _CLIENT is None:
-        _CLIENT = TSDBClient(level="mdss", pool_size=_POOL_SIZE)
+        _CLIENT = TSDBClient(level="mdss", pool_size=MAX_CONNECTIONS)
     return _CLIENT
 
 
@@ -287,15 +297,22 @@ def fetch_positions(start, end, marks: list[str] | None = None) -> dict[str, tup
 # ---------------------------------------------------------------------------
 
 def parallel(*calls):
-    """Run zero-argument fetches concurrently and return their results in order.
+    """Run zero-argument fetches and return their results in order.
 
-    Each poll needs several independent queries; run serially they add up to
-    more than the refresh interval. Nothing here touches Streamlit, so worker
-    threads are safe.
+    Concurrently where the connection budget allows it: each poll needs several
+    independent queries, and run one after another they add up to more than the
+    refresh interval. Nothing here touches Streamlit, so worker threads are
+    safe.
+
+    On a single connection they take turns instead. Threads would only queue on
+    the same connection anyway, and doing it here keeps the waiting out of the
+    pool, where it costs a thread apiece for nothing.
     """
     if not calls:
         return []
-    with ThreadPoolExecutor(max_workers=len(calls)) as ex:
+    if MAX_CONNECTIONS < 2 or len(calls) == 1:
+        return [c() for c in calls]
+    with ThreadPoolExecutor(max_workers=min(len(calls), MAX_CONNECTIONS)) as ex:
         return [f.result() for f in [ex.submit(c) for c in calls]]
 
 

@@ -64,14 +64,25 @@ class TSDBClient:
                     a psycopg2 connection is not thread-safe, and sharing one
                     across a thread pool interleaves protocol traffic and
                     corrupts results. Implies persistent behaviour.
+
+                    Size it to what the server actually allows the role. Asking
+                    for more does not get you more - the extras are refused at
+                    connect time, and the first query to want one fails.
         """
         self.level = level
         self.pool_size = pool_size
         self.persistent = persistent or pool_size > 0
         self._conn = None
         self._pool = None
+        self._slots = None
         if pool_size > 0:
+            import threading
             from psycopg2.pool import ThreadedConnectionPool
+            # Callers queue for a connection rather than being turned away.
+            # psycopg2's pool raises PoolError the moment every connection is
+            # checked out, so without this a second viewer, or a fetch that
+            # overlaps the one before it, is an error rather than a short wait.
+            self._slots = threading.BoundedSemaphore(pool_size)
             self._pool = ThreadedConnectionPool(
                 1, pool_size, **tsdb_config.connection_kwargs())
 
@@ -110,6 +121,17 @@ class TSDBClient:
         self.close()
 
     def _run(self, sql, params):
+        # Wait for a free slot before touching the pool, so a busy moment costs
+        # a query its turn rather than failing it outright.
+        if self._slots is not None:
+            self._slots.acquire()
+        try:
+            return self._execute(sql, params)
+        finally:
+            if self._slots is not None:
+                self._slots.release()
+
+    def _execute(self, sql, params):
         conn, disposition = self._acquire()
         try:
             with conn.cursor() as cur:
