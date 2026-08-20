@@ -74,6 +74,13 @@ BOARD_THRESH_MM = 200.0
 # Past this the buffer is too stale to extend, so refill it outright.
 BOARD_REFILL_GAP = pd.Timedelta("20s")
 
+# A dropped connection must not take the page down -- an unhandled error in a
+# fragment that reruns every second or three is a crash loop, and each restart
+# strands the pool's connections server-side until they idle out, which is how
+# one refused connection becomes a widget that can never reconnect. Hold the
+# last frame, say so, and leave the server alone for a bit.
+FEED_RETRY_S = 10
+
 st.set_page_config(page_title="Course Wind", page_icon="🌬️",
                    layout="centered", initial_sidebar_state="collapsed")
 
@@ -638,6 +645,10 @@ ss.setdefault("range_twd", None)
 ss.setdefault("range_tws", None)
 ss.setdefault("board_buf", None)  # rolling daggerboard trace
 ss.setdefault("wind_bits", [])    # status from the slow fragment, drawn by the fast one
+ss.setdefault("wind_html", None)  # last good frame, put back up if the feed drops
+ss.setdefault("board_html", None)
+ss.setdefault("board_bit", None)
+ss.setdefault("feed_at", None)    # when the feed last failed, for the back-off
 
 mode = st.segmented_control("Mode", ["Live", "Replay"], default=ss["mode"],
                             key="mode_ctl", label_visibility="collapsed")
@@ -679,45 +690,91 @@ def virtual_now() -> pd.Timestamp:
     return replay_start + pd.Timedelta(seconds=elapsed)
 
 
+def feed_ready() -> bool:
+    """False while the back-off after a connection failure is still running."""
+    at = ss["feed_at"]
+    return at is None or time.time() - at >= FEED_RETRY_S
+
+
+def feed_failed(exc: Exception) -> None:
+    """Start the back-off and let go of the pool.
+
+    The detail goes to the server log rather than the page: the message names
+    the role and the host, and neither belongs in a browser. On Streamlit Cloud
+    it lands in Manage app -> logs.
+    """
+    wd.reset_client()
+    ss["feed_at"] = time.time()
+    print(f"[feed] {type(exc).__name__}: {exc}", flush=True)
+
+
+def feed_bits() -> list[str]:
+    return [] if ss["feed_at"] is None else ["<span class='warn'>connection lost</span>"]
+
+
+def blank_wind() -> str:
+    """An all-dashes frame, for a feed that has never once answered."""
+    return render(compute(pd.DataFrame(), pd.DataFrame(), {}, sma), {},
+                  compute_boat(pd.DataFrame()), sma_min)
+
+
 def draw():
     """Wind and boat trim. Slower cadence -- none of it changes in a second."""
-    if mode == "Live":
-        now = pd.Timestamp.utcnow().tz_localize(None)
-        (twd, tws), boat, pos = fetch_live(now, sma)
-        r = compute(twd, tws, pos, sma)
-        rng = live_range(now, r)
-        vnow, tag, replay = now, "live", False
-    else:
-        vnow = virtual_now()
-        twd, tws, boat, pos = fetch_replay(vnow, sma)
-        r = compute(twd, tws, pos, sma)
-        # Replay already holds the whole window in the cached block, so there
-        # is nothing to throttle.
-        rng = wind_range(twd, tws, r["course_twd"], r["course_tws"])
-        tag = "replay &#9654;" if ss["playing"] else "replay &#9208;"
-        replay = True
+    if feed_ready():
+        try:
+            if mode == "Live":
+                now = pd.Timestamp.utcnow().tz_localize(None)
+                (twd, tws), boat, pos = fetch_live(now, sma)
+                r = compute(twd, tws, pos, sma)
+                rng = live_range(now, r)
+                vnow, tag, replay = now, "live", False
+            else:
+                vnow = virtual_now()
+                twd, tws, boat, pos = fetch_replay(vnow, sma)
+                r = compute(twd, tws, pos, sma)
+                # Replay already holds the whole window in the cached block, so
+                # there is nothing to throttle.
+                rng = wind_range(twd, tws, r["course_twd"], r["course_tws"])
+                tag = "replay &#9654;" if ss["playing"] else "replay &#9208;"
+                replay = True
 
-    # The status line is drawn by the board fragment so it sits at the bottom
-    # and, in replay, ticks once a second with the clock.
-    ss["wind_bits"] = status_bits(r, tag, vnow, replay)
-    st.markdown(render(r, rng, compute_boat(boat), sma_min),
-                unsafe_allow_html=True)
+            # The status line is drawn by the board fragment so it sits at the
+            # bottom and, in replay, ticks once a second with the clock.
+            ss["wind_bits"] = status_bits(r, tag, vnow, replay)
+            ss["wind_html"] = render(r, rng, compute_boat(boat), sma_min)
+            ss["feed_at"] = None
+        except wd.FEED_ERRORS as e:
+            feed_failed(e)
+
+    # Whatever happened, put a frame up -- the last good one if there is one.
+    # The wind bits keep the timestamp it was current at, so a held frame is
+    # never mistaken for a live one.
+    st.markdown(ss["wind_html"] or blank_wind(), unsafe_allow_html=True)
 
 
 def draw_boards():
     """Board cycling. Its own timer, so a slow wind query cannot hold it up,
     and only the newest second of cant is fetched each tick."""
-    if mode == "Live":
-        now = pd.Timestamp.utcnow().tz_localize(None)
-        buf = board_buffer(now)
-    else:
-        now = virtual_now()
-        buf = _upto(_replay_board(now.floor(REPLAY_BLOCK)), now)
+    if feed_ready():
+        try:
+            if mode == "Live":
+                now = pd.Timestamp.utcnow().tz_localize(None)
+                buf = board_buffer(now)
+            else:
+                now = virtual_now()
+                buf = _upto(_replay_board(now.floor(REPLAY_BLOCK)), now)
 
-    counts = board_counts(buf, now)
-    st.markdown(render_boards(counts)
-                + status_line(list(ss["wind_bits"]) + [board_age_bit(counts)]),
-                unsafe_allow_html=True)
+            counts = board_counts(buf, now)
+            ss["board_html"] = render_boards(counts)
+            ss["board_bit"] = board_age_bit(counts)
+            ss["feed_at"] = None
+        except wd.FEED_ERRORS as e:
+            feed_failed(e)
+
+    bits = list(ss["wind_bits"])
+    bits.append(ss["board_bit"] or board_age_bit({}))
+    st.markdown((ss["board_html"] or render_boards({}))
+                + status_line(bits + feed_bits()), unsafe_allow_html=True)
 
 
 def live_range(now: pd.Timestamp, r: dict) -> dict:

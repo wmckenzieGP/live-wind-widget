@@ -16,8 +16,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 import arrow
 import pandas as pd
+import psycopg2
 
-from tsdb_client import TSDBClient
+from tsdb_client import TSDBClient, TSDBTimeout
+
+# "The database is not answering right now", as opposed to "that query was
+# wrong". A caller on a timer can hold its last frame through one of these and
+# try again; anything else is a bug and should surface.
+FEED_ERRORS = (psycopg2.OperationalError, psycopg2.InterfaceError, TSDBTimeout)
 
 TOP_MARKS = ["WG1", "WG2"]        # windward gate
 BOTTOM_MARKS = ["LG1", "LG2"]     # leeward gate
@@ -76,7 +82,15 @@ def _client() -> TSDBClient:
     return _CLIENT
 
 
-def _reset_client() -> None:
+def reset_client() -> None:
+    """Drain the pool and forget it, so the next call builds a fresh one.
+
+    Worth doing after a connection failure as well as on the way out: the
+    connections the pool is holding go back to the server now, rather than
+    sitting there until an idle timeout reaps them. If the server refused us
+    because we were already holding too many, hanging on to them is the one
+    thing that guarantees the next attempt fails too.
+    """
     global _CLIENT
     try:
         if _CLIENT is not None:
@@ -89,7 +103,7 @@ def _reset_client() -> None:
 # Close on the way out, while the modules the client needs are still alive --
 # left to __del__ during interpreter teardown it raises on a half-torn-down
 # module and prints an ignored-exception traceback.
-atexit.register(_reset_client)
+atexit.register(reset_client)
 
 
 def _fmt(dt) -> str:

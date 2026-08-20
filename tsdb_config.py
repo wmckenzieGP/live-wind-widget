@@ -57,6 +57,11 @@ TSDB_PORT     = int(_get("TSDB_PORT", 5432))
 TSDB_DB       = _get("TSDB_DB", "sailgp")
 TSDB_USER     = _get("TSDB_USER")
 TSDB_PASSWORD = _get("TSDB_PASSWORD")
+# libpq waits forever by default. A caller polling on a timer needs a refused
+# or unreachable server to come back as an error it can handle, not as a thread
+# parked on a handshake that is never going to finish. The TLS handshake itself
+# measures ~3.3 s, so this leaves room for a slow one.
+TSDB_CONNECT_TIMEOUT = int(_get("TSDB_CONNECT_TIMEOUT", 10))
 
 _cert_pem = _get("TSDB_SSLCERT_PEM")
 _key_pem = _get("TSDB_SSLKEY_PEM")
@@ -88,6 +93,7 @@ def connection_kwargs():
     return dict(
         host=TSDB_HOST, port=TSDB_PORT, dbname=TSDB_DB,
         user=TSDB_USER, password=TSDB_PASSWORD,
+        connect_timeout=TSDB_CONNECT_TIMEOUT,
         sslmode="verify-full",           # server refuses anything weaker
         sslcert=TSDB_SSLCERT, sslkey=TSDB_SSLKEY,
         # certifi validates the public server cert on every OS. Do NOT point
