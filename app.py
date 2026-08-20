@@ -18,8 +18,8 @@ import streamlit as st
 import wind_data as wd
 from wind_math import (bearing, board_movements, circular_ema,
                        circular_mean_columns, circular_sma, distance_m, held,
-                       midpoint, shade, signed_diff, signed_diff_series,
-                       sustained_extremes)
+                       midpoint, project, shade, signed_diff,
+                       signed_diff_series, sustained_extremes)
 
 EMA_HALFLIFE = pd.Timedelta("20s")
 LIVE_REFRESH_S = 3
@@ -85,6 +85,10 @@ st.markdown("""
   .tile {background: #ffffff; border: 1px solid #e3e5e8; border-radius: 8px;
          padding: 8px 10px 7px; text-align: center;}
   .tile.wide {grid-column: 1 / -1;}
+  /* A gate reads as one row -- TWD, bias, TWS -- so the three share the full
+     width the pair used to have. */
+  .trio {grid-column: 1 / -1; display: grid;
+         grid-template-columns: 1fr 1fr 1fr; gap: 6px;}
   .lbl {font-size: 9.5px; font-weight: 700; letter-spacing: .09em;
         text-transform: uppercase; color: #6b7178; line-height: 1.3;}
   .row {position: relative;}
@@ -98,6 +102,11 @@ st.markdown("""
         display: flex; flex-direction: column; text-align: right;
         font-size: 10px; font-weight: 700; color: #6b7178; line-height: 1.45;
         letter-spacing: .02em; font-variant-numeric: tabular-nums;}
+  /* A footnote under the big number. The tile grows by its height and the rest
+     of the row stretches with it, so the big numbers stay on one baseline. */
+  .sub {font-size: 9.5px; font-weight: 700; letter-spacing: .05em;
+        color: #6b7178; line-height: 1.25; padding-top: 1px;
+        font-variant-numeric: tabular-nums;}
   .sect {grid-column: 1 / -1; font-size: 10px; font-weight: 700;
          letter-spacing: .16em; text-transform: uppercase; color: #6b7178;
          text-align: center; padding: 7px 0 0;}
@@ -188,6 +197,7 @@ def _upto(df: pd.DataFrame, when: pd.Timestamp) -> pd.DataFrame:
 def compute(twd: pd.DataFrame, tws: pd.DataFrame, pos: dict, sma: pd.Timedelta) -> dict:
     r = {"axis": float("nan"), "deployed": False, "separation": float("nan"),
          "course_twd": float("nan"), "course_tws": float("nan"),
+         "top_bias": None, "bottom_bias": None,
          "missing": [], "latest": None}
 
     # Course axis: bottom gate midpoint -> top gate midpoint.
@@ -222,7 +232,57 @@ def compute(twd: pd.DataFrame, tws: pd.DataFrame, pos: dict, sma: pd.Timedelta) 
         r[f"{key}_tws"] = (tws[cs].mean(axis=1).ewm(halflife=EMA_HALFLIFE, times=tws.index)
                            .mean().iloc[-1] if cs and not tws.empty else float("nan"))
         r[f"{key}_offset"] = signed_diff(r[f"{key}_twd"], r["course_twd"])
+        r[f"{key}_bias"] = gate_bias(pos, marks, r[f"{key}_twd"],
+                                     upwind=(key == "top"),
+                                     deployed=r["deployed"])
     return r
+
+
+def gate_bias(pos: dict, marks: list[str], twd: float,
+              upwind: bool, deployed: bool) -> dict | None:
+    """Which end of a gate pays, and by how much.
+
+    One mark of a gate sits further along the wind axis than the other. Round
+    the near one and that offset is saved twice -- once not sailing down to the
+    far mark, and again not sailing back up -- so the gain is twice the
+    along-wind separation of the pair.
+
+    Everything is read from the approaching boat: the top gate upwind, the
+    bottom gate downwind. That puts `along` ahead of the boat at either end, so
+    the favoured mark is simply the nearer one, and left and right mean what
+    they mean on board rather than on a chart.
+
+    `square` is the wind the gate was laid for -- the perpendicular to the line
+    between the marks, taken upwind. Read against the gate TWD beside it, it
+    says where the bias came from: the gain is whatever the wind has shifted
+    off square.
+    """
+    if not deployed or twd is None or pd.isna(twd):
+        return None
+    pts = [pos[m] for m in marks if m in pos]
+    if len(pts) != 2:
+        return None
+    mid = midpoint(pts)
+    if mid is None:
+        return None
+
+    heading = twd if upwind else (twd + 180.0) % 360.0
+    legs = [project(mid, p, heading) for p in pts]
+    near = min(legs, key=lambda leg: leg[0])
+    return {"side": "R" if near[1] >= 0 else "L",
+            "gain": 2.0 * abs(legs[0][0] - legs[1][0]),
+            "square": square_to(pts, twd)}
+
+
+def square_to(pts: list[tuple[float, float]], twd: float) -> float:
+    """The upwind normal to a gate line -- the TWD the gate is square to.
+
+    A line has two perpendiculars, 180 deg apart. The one that matters is the
+    one pointing up the course, so take whichever sits nearer the wind.
+    """
+    line = bearing(pts[0], pts[1])
+    perps = ((line + 90.0) % 360.0, (line - 90.0) % 360.0)
+    return min(perps, key=lambda p: abs(signed_diff(p, twd)))
 
 
 def wind_range(twd: pd.DataFrame, tws: pd.DataFrame,
@@ -437,6 +497,18 @@ def _num(v, dp: int = 1, unit: str = "&deg;") -> str:
     return DASH if v is None or pd.isna(v) else f"{v:.{dp}f}{unit}"
 
 
+def _bias(v: dict | None) -> str:
+    """Favoured end and the metres it is worth, e.g. "R 90"."""
+    return DASH if not v else f"{v['side']}&nbsp;{v['gain']:.0f}"
+
+
+def _square(v: dict | None) -> str:
+    """The wind the gate is square to, as a footnote under the bias."""
+    if not v or pd.isna(v.get("square")):
+        return ""
+    return f"<div class='sub'>SQ {_deg(v['square'])}</div>"
+
+
 def _signed(v, dp: int = 0, unit: str = "&deg;") -> str:
     """A deviation, always carrying its sign."""
     if v is None or pd.isna(v):
@@ -450,7 +522,7 @@ def _range(hi, lo, dp: int = 0, unit: str = "&deg;") -> str:
 
 
 def _tile(label: str, value: str, bg: str = "#ffffff", wide=False, small=False,
-          extra: str = "", alarm=False) -> str:
+          extra: str = "", alarm=False, sub: str = "") -> str:
     # An alarm tile animates its own background, so leave the inline colour off
     # and let the keyframes own it.
     style = "" if alarm else f" style='background:{bg}'"
@@ -458,7 +530,7 @@ def _tile(label: str, value: str, bg: str = "#ffffff", wide=False, small=False,
     return (f"<div class='{classes}'{style}>"
             f"<div class='lbl'>{label}</div>"
             f"<div class='row'><div class='val{' sm' if small else ''}'>{value}</div>"
-            f"{extra}</div></div>")
+            f"{extra}</div>{sub}</div>")
 
 
 def render(r: dict, rng: dict, b: dict, sma_min: int) -> str:
@@ -471,6 +543,14 @@ def render(r: dict, rng: dict, b: dict, sma_min: int) -> str:
     def gbg(key):
         return shade(r.get(f"{key}_offset")) if r["deployed"] else "#ffffff"
 
+    def gate(key: str, label: str) -> str:
+        return ("<div class='trio'>"
+                + _tile(f"{label} TWD", _deg(r.get(f"{key}_twd")), gbg(key))
+                + _tile(f"{label} Bias", _bias(r.get(f"{key}_bias")),
+                        sub=_square(r.get(f"{key}_bias")))
+                + _tile(f"{label} TWS", _kmh(r.get(f"{key}_tws")))
+                + "</div>")
+
     return (
         "<div class='grid'>"
         + axis
@@ -478,10 +558,8 @@ def render(r: dict, rng: dict, b: dict, sma_min: int) -> str:
                 extra=_range(rng.get("twd_hi"), rng.get("twd_lo"), 0, "&deg;"))
         + _tile(f"Course TWS &middot; {sma_min}m", _kmh(r["course_tws"]),
                 extra=_range(rng.get("tws_hi"), rng.get("tws_lo"), 1, ""))
-        + _tile("Top TWD", _deg(r.get("top_twd")), gbg("top"))
-        + _tile("Top TWS", _kmh(r.get("top_tws")))
-        + _tile("Bottom TWD", _deg(r.get("bottom_twd")), gbg("bottom"))
-        + _tile("Bottom TWS", _kmh(r.get("bottom_tws")))
+        + gate("top", "Top")
+        + gate("bottom", "Bottom")
         + f"<div class='sect'>{wd.BOAT}</div>"
         # ---- boat tiles ----
         + _tile("Rud AVG", _num(b.get("rud_avg")))

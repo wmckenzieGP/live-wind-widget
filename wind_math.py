@@ -216,6 +216,21 @@ def distance_m(p1: tuple[float, float], p2: tuple[float, float]) -> float:
     return float(2 * EARTH_R * np.arcsin(np.sqrt(a)))
 
 
+def project(p1: tuple[float, float], p2: tuple[float, float],
+            heading: float) -> tuple[float, float]:
+    """Resolve p1 -> p2 into along-track and cross-track metres about `heading`.
+
+    Along is positive ahead of a boat on that heading, cross positive to its
+    right. Both fall straight out of the bearing and range, so no local grid
+    has to be set up.
+    """
+    d = distance_m(p1, p2)
+    if d == 0.0:
+        return 0.0, 0.0
+    th = np.radians(bearing(p1, p2) - heading)
+    return float(d * np.cos(th)), float(d * np.sin(th))
+
+
 # ---------------------------------------------------------------------------
 # Colour ramp
 # ---------------------------------------------------------------------------
