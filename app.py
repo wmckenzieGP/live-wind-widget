@@ -3,9 +3,10 @@
 Course wind, boat trim and board cycling, designed to be shrunk into the corner
 of a screen and left running. No login.
 
-Live mode queries TimescaleDB every 3 s with no buffering, so the leading edge
-is always current. Replay mode prefetches in blocks and advances a virtual
-clock at normal speed, driving the identical calculation path.
+Live mode queries TimescaleDB with no buffering, so the leading edge is always
+current: wind and trim every 3 s, board cycling every 500 ms on its own timer.
+Replay mode prefetches in blocks and advances a virtual clock at normal speed,
+driving the identical calculation path.
 """
 from __future__ import annotations
 
@@ -61,12 +62,18 @@ CAMBER_MIN_TARGET = 1.0           # below this no camber is set, so no percentag
 
 # Board cycling. More than six movements per board inside a rolling minute is a
 # penalty, so this counter is fed back to the sailors live and is the one
-# metric where lag actually costs something. It redraws on its own 1 s timer,
+# metric where lag actually costs something. It redraws on its own timer,
 # independent of the wind tiles, and fetches only the delta each tick.
 BOARD_LIMIT = 6
 BOARD_WINDOW = pd.Timedelta("60s")
 BOARD_BUFFER = pd.Timedelta("150s")   # trace held locally; > window, for warm-up
-BOARD_TICK_S = 1
+# Half a second, not a second: waiting for the next redraw is dead time between
+# data landing and a sailor seeing it, and halving the tick halves the average
+# wait. It cannot go much below this -- the fetch itself measures ~0.28 s, and a
+# tick shorter than its own query just queues requests faster than they return.
+# At 500 ms the query occupies a bit over half the tick, which is the practical
+# floor for polling.
+BOARD_TICK_S = 0.5
 # Height change that counts as a movement. Full board travel is about 1900 mm
 # and real raises and lowers run the whole way, so this only has to clear the
 # sensor's own jitter.
@@ -954,8 +961,8 @@ def draw():
 
 
 def draw_boards():
-    """Board cycling. Its own timer, so a slow wind query cannot hold it up,
-    and only the newest second of cant is fetched each tick."""
+    """Board cycling and the height traces. Its own timer, so a slow wind query
+    cannot hold it up, and only the newest half-second of height is fetched."""
     if feed_ready():
         try:
             if mode == "Live":
@@ -1004,7 +1011,7 @@ elif ss["playing"]:
 else:
     every = board_every = None   # paused: hold the frame, no polling
 
-# Two timers. The board counter is the one metric where a second matters, so
-# it redraws on its own and never waits on the wind queries.
+# Two timers. The board counter is the one metric where a second matters, so it
+# redraws twice as often as the wind and never waits on the wind queries.
 st.fragment(run_every=every)(draw)()
 st.fragment(run_every=board_every)(draw_boards)()

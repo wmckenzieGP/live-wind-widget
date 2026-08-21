@@ -145,8 +145,12 @@ threshold never goes below 3 available, so it does not cry wolf when foiling.
 This is the one metric where lag costs something, so it is built differently
 from the rest of the widget:
 
-- **Its own 1-second fragment.** It redraws on a separate timer and never waits
-  on the wind queries.
+- **Its own 500 ms fragment.** It redraws on a separate timer and never waits on
+  the wind queries. Waiting for the next redraw is dead time between data landing
+  and a sailor seeing it, so the tick is half the wind's — but it cannot go much
+  below this. The fetch itself measures ~0.28 s, and a tick shorter than its own
+  query only queues requests faster than they come back; at 500 ms the query
+  occupies a bit over half the tick, which is the practical floor for polling.
 - **A pool of warm TimescaleDB connections.** Opening a connection per query
   costs a TLS handshake — measured at 3.3 s against 1.0 s on a reused one. The
   pool (`TSDB_MAX_CONNECTIONS`, 3 by default) is shared by every query in the app. It is a
@@ -154,7 +158,7 @@ from the rest of the widget:
   fetches at once and a psycopg2 connection is not thread-safe.
 - **Incremental fetch.** A rolling 150-second trace is held in session state and
   extended with only the samples that arrived since the last one, typically
-  about a second's worth. A tick costs ~0.28 s of query and ~6 ms of counting.
+  half a second's worth. A tick costs ~0.28 s of query and ~6 ms of counting.
   If the buffer falls more than 20 s behind it is refilled outright rather than
   spliced across a hole.
 
@@ -171,7 +175,7 @@ showing the last **15 seconds** of raw board height. They exist to answer one
 question: how far behind the boat is the data?
 
 They read off the *same* session-state buffer as the counter, in the same 200 ms
-buckets, on the same 1-second tick. No extra query, no second connection, and
+buckets, on the same 500 ms tick. No extra query, no second connection, and
 nothing the plots can say that the tiles above them would disagree with.
 
 **The x-axis is pinned to the wall clock, not to the newest sample**, and that is
@@ -323,4 +327,4 @@ only and contains live credentials.
 Each poll runs its queries concurrently (`wind_data.parallel`), so the cycle
 costs about as long as its slowest query rather than their sum. Two fragments
 drive the page on separate timers: wind and trim on the slow one, board cycling
-on its own 1-second tick.
+on its own 500 ms tick.
