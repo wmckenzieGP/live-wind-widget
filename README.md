@@ -149,7 +149,7 @@ from the rest of the widget:
   on the wind queries.
 - **A pool of warm TimescaleDB connections.** Opening a connection per query
   costs a TLS handshake — measured at 3.3 s against 1.0 s on a reused one. The
-  pool (`TSDBClient(pool_size=6)`) is shared by every query in the app. It is a
+  pool (`TSDB_MAX_CONNECTIONS`, 3 by default) is shared by every query in the app. It is a
   pool rather than a single shared connection because `parallel()` runs several
   fetches at once and a psycopg2 connection is not thread-safe.
 - **Incremental fetch.** A rolling 150-second trace is held in session state and
@@ -163,6 +163,41 @@ movement made 61 s ago has aged out whether or not the feed is keeping up. Feed
 lag shows in the status line instead, as `boards 0.4s`, which turns amber past
 3 s — a stale counter is worse than no counter, so it has to be visible. That
 figure assumes the machine clock is synced.
+
+### Height trace
+
+Under the two counters sit two plots — **Port Height** and **Stbd Height** — each
+showing the last **15 seconds** of raw board height. They exist to answer one
+question: how far behind the boat is the data?
+
+They read off the *same* session-state buffer as the counter, in the same 200 ms
+buckets, on the same 1-second tick. No extra query, no second connection, and
+nothing the plots can say that the tiles above them would disagree with.
+
+**The x-axis is pinned to the wall clock, not to the newest sample**, and that is
+the whole point. The trace ends where the data ends; everything between there and
+the right-hand edge is shaded, and that shaded width *is* the feed lag. Watch the
+board move on the water, watch the trace move, and the difference between them is
+the number you are after. Each plot also states it: `0.4s behind`, per channel, so
+one sensor dropping out while the other reports is visible. Amber past 3 s.
+
+Two more things the plots are deliberate about:
+
+- **The line breaks across a hole in the feed** rather than drawing through it.
+  A clean line across a dropout would read as data and would hide exactly what is
+  being looked for. Anything over a 1-second gap starts a new segment.
+- **The y-domain is fixed at 0–1900 mm** (nominal full travel) and **shared by both
+  boards**, so a movement is the same size on either plot and the two can be read
+  against each other. Autoscaling would be actively misleading here: a parked board
+  measures 0.5 mm peak to peak, and rescaling to that turns sensor noise into a
+  mountain range. The domain grows only if the data runs outside it.
+
+Drawn as inline SVG rather than through a charting library — a Vega or Matplotlib
+figure inside a fragment that reruns every second would cost more render time than
+the query it is meant to be measuring.
+
+Both plots read the buffer, so they work unchanged in replay, showing the 15 s
+behind the virtual clock.
 
 ## Replay clock
 

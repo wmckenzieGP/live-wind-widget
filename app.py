@@ -74,6 +74,25 @@ BOARD_THRESH_MM = 200.0
 # Past this the buffer is too stale to extend, so refill it outright.
 BOARD_REFILL_GAP = pd.Timedelta("20s")
 
+# Board height trace. The last 15 s of raw height, off the same buffer and the
+# same 200 ms buckets the counter runs on -- no extra query, and nothing here
+# can disagree with the tiles above it because it is the same samples.
+#
+# The x-axis is pinned to the wall clock, not to the newest sample, so the gap
+# between the end of the trace and the right edge IS the feed lag. Watch the
+# boat move, watch the trace move, and the difference between them is the thing
+# being measured. Anchoring to the newest sample would hide it.
+TRACE_WINDOW = pd.Timedelta("15s")
+TRACE_GAP = pd.Timedelta("1s")     # a hole bigger than this breaks the line
+TRACE_W, TRACE_H = 436, 54         # SVG user units; CSS scales it to the tile
+# Breathing room top and bottom. A parked board sits at the end of its travel,
+# which is the edge of the domain -- without the inset that trace is drawn on
+# y=0 and the plot border cuts its stroke in half, which is the normal resting
+# state of the thing and so the state it must not look broken in.
+TRACE_PAD = 4
+TRACE_FULL_MM = 1900.0             # nominal full travel -- the default y-domain
+TRACE_LAG_WARN = 3.0               # seconds behind before the readout goes amber
+
 # A dropped connection must not take the page down -- an unhandled error in a
 # fragment that reruns every second or three is a crash loop, and each restart
 # strands the pool's connections server-side until they idle out, which is how
@@ -127,6 +146,27 @@ st.markdown("""
   .clock {font-size: 12px; font-weight: 700; color: #3d4349;
           font-variant-numeric: tabular-nums; letter-spacing: .02em;}
   .warn {color: #a8500f; font-weight: 600;}
+  /* Board height trace. Same tile treatment as everything else, but tighter --
+     it sits under two full tiles and the widget still has to fit in a corner. */
+  .trace {background: #ffffff; border: 1px solid #e3e5e8; border-radius: 8px;
+          padding: 5px 7px 3px; margin-top: 6px;}
+  .trace + .trace {margin-top: 4px;}
+  .thead {display: flex; justify-content: space-between; align-items: baseline;
+          gap: 6px; font-size: 9.5px; font-weight: 700; letter-spacing: .09em;
+          text-transform: uppercase; color: #6b7178; line-height: 1.3;
+          padding-bottom: 2px;}
+  /* The line colour repeated beside the label, so the plot is never identified
+     by colour alone -- red and green are the one pair that needs the words. */
+  .tdot {display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+         margin-right: 4px; vertical-align: baseline;}
+  .tval {font-size: 11px; font-weight: 700; color: #000000; letter-spacing: .02em;
+         font-variant-numeric: tabular-nums; text-transform: none;}
+  .tlag {font-variant-numeric: tabular-nums; text-transform: none;}
+  .trace svg {display: block; width: 100%; height: auto;}
+  /* One shared x-axis under the pair -- both plots span the same 15 s. */
+  .taxis {display: flex; justify-content: space-between; font-size: 9px;
+          font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+          color: #9aa0a6; padding: 3px 8px 0;}
   div[data-testid="stExpander"] details {border: none;}
   div[data-testid="stExpander"] summary {font-size: 11px; color: #6b7178;}
 </style>
@@ -580,6 +620,13 @@ def render(r: dict, rng: dict, b: dict, sma_min: int) -> str:
 
 
 PORT_BG, STBD_BG = "#fbe4e4", "#e2f2e6"
+# Line colours for the height traces -- the tile backgrounds are far too pale to
+# draw with. Port red and starboard green are the convention and worth keeping,
+# but they are also the one pair a red-green reader cannot separate (CVD dE 7.2,
+# inside the 6-8 band that is only allowed alongside another cue). Hence two
+# separate plots, each titled and dotted with its own colour: the words carry
+# the identity and the colour only confirms it.
+PORT_LINE, STBD_LINE = "#e34948", "#008300"
 
 
 def render_boards(c: dict) -> str:
@@ -604,6 +651,140 @@ def board_age_bit(c: dict) -> str:
         return "<span class='warn'>no boards</span>"
     cls = "warn" if age > 3 else ""
     return f"<span class='{cls}'>boards {age:.1f}s</span>"
+
+
+# ---------------------------------------------------------------------------
+# Board height trace
+#
+# Inline SVG rather than a charting library. A Vega or Matplotlib figure inside
+# a fragment that reruns every second would cost more render time than the query
+# it is meant to be measuring, which on a lag diagnostic is self-defeating.
+# ---------------------------------------------------------------------------
+
+def trace_series(buf: pd.DataFrame, col: str, now: pd.Timestamp) -> pd.Series:
+    """The last TRACE_WINDOW of one height channel, oldest sample first."""
+    if buf is None or buf.empty or col not in buf.columns:
+        return pd.Series(dtype=float)
+    v = buf[col].dropna()
+    return v[v.index >= now - TRACE_WINDOW]
+
+
+def trace_domain(*series: pd.Series) -> tuple[float, float]:
+    """One y-domain shared by both boards, so port and starboard can be read
+    against each other and a movement is the same size on either plot.
+
+    Fixed to nominal full travel unless the data runs outside it. Autoscaling
+    would be worse than useless here: a parked board measures 0.5 mm peak to
+    peak, and rescaling to that turns sensor noise into a mountain range.
+    """
+    lo, hi = 0.0, TRACE_FULL_MM
+    for v in series:
+        if v is not None and not v.empty:
+            lo, hi = min(lo, float(v.min())), max(hi, float(v.max()))
+    return lo, (hi if hi - lo >= 1.0 else lo + 1.0)
+
+
+def trace_segments(v: pd.Series, now: pd.Timestamp,
+                   lo: float, hi: float) -> list[str]:
+    """Polyline point strings in SVG user units, broken across holes in the feed.
+
+    Drawing straight through a dropout would read as data. It is not, and on a
+    plot whose entire job is showing when samples land, a clean line across a
+    gap hides the one thing being looked for.
+    """
+    t0, span, rng = now - TRACE_WINDOW, TRACE_WINDOW.total_seconds(), hi - lo
+    plot_h = TRACE_H - 2 * TRACE_PAD
+    segs, cur, prev = [], [], None
+    for ts, mm in v.items():
+        if prev is not None and ts - prev > TRACE_GAP:
+            segs.append(cur)
+            cur = []
+        x = min(max((ts - t0).total_seconds() / span, 0.0), 1.0) * TRACE_W
+        y = TRACE_PAD + (1.0 - min(max((mm - lo) / rng, 0.0), 1.0)) * plot_h
+        cur.append(f"{x:.1f},{y:.1f}")
+        prev = ts
+    segs.append(cur)
+    return [" ".join(s) for s in segs if s]
+
+
+def trace_svg(v: pd.Series, colour: str, label: str,
+              now: pd.Timestamp, lo: float, hi: float) -> str:
+    """One plot: hairline grid, the lag gap shaded, the trace, and `now`.
+
+    `vector-effect` keeps the 2 px line 2 px wide however the viewBox is scaled
+    to the tile -- without it a narrow window squashes the stroke with the plot.
+    """
+    grid = "".join(
+        f"<line x1='{TRACE_W * f:.1f}' y1='0' x2='{TRACE_W * f:.1f}' y2='{TRACE_H}'/>"
+        for f in (1 / 3, 2 / 3)
+    ) + f"<line x1='0' y1='{TRACE_H / 2}' x2='{TRACE_W}' y2='{TRACE_H / 2}'/>"
+
+    # Everything to the right of the newest sample is data that has not arrived.
+    # Shading it makes the lag a visible width rather than a number to remember.
+    gap, dot = "", ""
+    if not v.empty:
+        segs = trace_segments(v, now, lo, hi)
+        x_end, y_end = segs[-1].split()[-1].split(",")
+        if float(x_end) < TRACE_W - 0.5:
+            gap = (f"<rect x='{x_end}' y='0' width='{TRACE_W - float(x_end):.1f}' "
+                   f"height='{TRACE_H}' fill='#f2f3f5'/>")
+        line = "".join(
+            f"<polyline points='{s}' fill='none' stroke='{colour}' stroke-width='2' "
+            f"stroke-linejoin='round' stroke-linecap='round' "
+            f"vector-effect='non-scaling-stroke'/>" for s in segs
+        )
+        # A surface ring on the leading sample, so it reads as the end of the
+        # trace and not as part of it.
+        dot = (f"<circle cx='{x_end}' cy='{y_end}' r='3' fill='{colour}' "
+               f"stroke='#ffffff' stroke-width='2' vector-effect='non-scaling-stroke'>"
+               f"<title>{label}: newest sample {v.index[-1]:%H:%M:%S.%f}Z</title>"
+               f"</circle>")
+    else:
+        line = ""
+
+    return (
+        f"<svg viewBox='0 0 {TRACE_W} {TRACE_H}' preserveAspectRatio='none' "
+        f"role='img' aria-label='{label} over the last 15 seconds'>"
+        + gap
+        + f"<g stroke='#eef0f2' stroke-width='1' vector-effect='non-scaling-stroke'>"
+        + grid + "</g>"
+        + line + dot
+        # The wall-clock edge. The distance from the trace to this line is the
+        # answer the plot exists to give.
+        + f"<line x1='{TRACE_W - 0.5}' y1='0' x2='{TRACE_W - 0.5}' y2='{TRACE_H}' "
+          f"stroke='#b9bec4' stroke-width='1' vector-effect='non-scaling-stroke'/>"
+        + "</svg>"
+    )
+
+
+def trace_tile(label: str, v: pd.Series, colour: str,
+               now: pd.Timestamp, lo: float, hi: float) -> str:
+    """A plot with its own header: current height and how far behind it is.
+
+    The lag is per channel rather than the buffer-wide age on the status line,
+    so one sensor dropping out while the other keeps reporting is visible.
+    """
+    head = f"<span><span class='tdot' style='background:{colour}'></span>{label}</span>"
+    if v.empty:
+        head += "<span class='tlag warn'>no data</span>"
+    else:
+        lag = max((now - v.index[-1]).total_seconds(), 0.0)
+        cls = "tlag warn" if lag > TRACE_LAG_WARN else "tlag"
+        head += (f"<span class='tval'>{float(v.iloc[-1]):,.0f} mm</span>"
+                 f"<span class='{cls}'>{lag:.1f}s behind</span>")
+    return (f"<div class='trace'><div class='thead'>{head}</div>"
+            + trace_svg(v, colour, label, now, lo, hi) + "</div>")
+
+
+def render_traces(buf: pd.DataFrame, now: pd.Timestamp) -> str:
+    """Both boards, one above the other, sharing a y-domain and an x-axis."""
+    p = trace_series(buf, wd.HEIGHT_P, now)
+    s = trace_series(buf, wd.HEIGHT_S, now)
+    lo, hi = trace_domain(p, s)
+    return (trace_tile("Port Height", p, PORT_LINE, now, lo, hi)
+            + trace_tile("Stbd Height", s, STBD_LINE, now, lo, hi)
+            + f"<div class='taxis'><span>-15s</span>"
+              f"<span>{lo:,.0f}&ndash;{hi:,.0f} mm</span><span>now</span></div>")
 
 
 def status_bits(r: dict, tag: str, vnow: pd.Timestamp | None,
@@ -648,6 +829,7 @@ ss.setdefault("wind_bits", [])    # status from the slow fragment, drawn by the 
 ss.setdefault("wind_html", None)  # last good frame, put back up if the feed drops
 ss.setdefault("board_html", None)
 ss.setdefault("board_bit", None)
+ss.setdefault("trace_html", None)   # last good height trace, held with the tiles
 ss.setdefault("feed_at", None)    # when the feed last failed, for the back-off
 ss.setdefault("feed_msg", None)   # and what it said, shown under the status line
 
@@ -786,6 +968,9 @@ def draw_boards():
             counts = board_counts(buf, now)
             ss["board_html"] = render_boards(counts)
             ss["board_bit"] = board_age_bit(counts)
+            # Same buffer, same tick, same wall clock as the counter above it --
+            # so the trace can never tell a different story from the tiles.
+            ss["trace_html"] = render_traces(buf, now)
             ss["feed_at"] = ss["feed_msg"] = None
         except wd.FEED_ERRORS as e:
             feed_failed(e)
@@ -793,6 +978,7 @@ def draw_boards():
     bits = list(ss["wind_bits"])
     bits.append(ss["board_bit"] or board_age_bit({}))
     st.markdown((ss["board_html"] or render_boards({}))
+                + (ss["trace_html"] or "")
                 + status_line(bits + feed_bits()), unsafe_allow_html=True)
 
 
