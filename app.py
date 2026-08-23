@@ -17,12 +17,13 @@ import pandas as pd
 import streamlit as st
 
 import wind_data as wd
-from wind_math import (bearing, board_movements, circular_ema,
-                       circular_mean_columns, circular_sma, distance_m, held,
-                       midpoint, project, shade, signed_diff,
+from wind_math import (bearing, board_movements, bridge, circular_ema,
+                       circular_mean_columns, circular_sma, distance_m,
+                       held, midpoint, project, shade, signed_diff,
                        signed_diff_series, sustained_extremes)
 
 EMA_HALFLIFE = pd.Timedelta("20s")
+FLASH_CYCLE = 1.1                 # seconds; keep in step with the alarm CSS
 LIVE_REFRESH_S = 3
 REPLAY_TICK_S = 1
 REPLAY_BLOCK = pd.Timedelta("10min")
@@ -42,14 +43,21 @@ BOAT_WINDOW = pd.Timedelta("60s")
 PITCH_AVG = pd.Timedelta("5s")
 RUD_DIFF_ZERO = 0.1               # |differential| at or below this reads zero
 RUD_DIFF_DWELL = pd.Timedelta("3s")
+# How long the differential has to stay above the band for the excursion to
+# count. The reading dithers across the line a sample at a time, and treating
+# each poke as a real break both stops a settled zero ever qualifying and drops
+# the alarm once it has.
+RUD_DIFF_BREAK = pd.Timedelta("3s")
+# Dither sits within a whisker of the band. Anything this far out is the rudder
+# actually differentiating, so it ends the alarm at once however brief it is --
+# without that, bridging welds a reading that straddles the band into a run
+# that qualifies, and the tile then flashes through a real differential.
+RUD_DIFF_BREAK_DEG = 0.2
 # Alarms only mean something under way. Parked, camber sits eased at a few
 # degrees against a 20 deg setting and the differential rests on zero, so
 # ungated both would flash most of the time the boat is not racing.
 SAILING_KMH = 15.0                # camber
-RUD_ALARM_KMH = 30.0              # differential: straight-line sailing only
-RUD_ALARM_YAW = 3.0               # deg/s; above this the boat is turning
-YAW_SMOOTH = pd.Timedelta("3s")   # the raw IMU rate is far too noisy to gate on
-RUD_ALARM_QUALIFY = pd.Timedelta("5s")
+RUD_ALARM_KMH = 30.0              # differential: speed is the only gate
 CAMBER_SETTLE = pd.Timedelta("3s")
 CAMBER_SETTLE_BAND = 3.0          # percent it may wander and still count settled
 # The actuators hunt a percent or two around the demand, so anything in the
@@ -143,10 +151,16 @@ st.markdown("""
   .sect {grid-column: 1 / -1; font-size: 10px; font-weight: 700;
          letter-spacing: .16em; text-transform: uppercase; color: #6b7178;
          text-align: center; padding: 7px 0 0;}
-  .tile.alarm {animation: alarm 1.1s ease-in-out infinite;}
+  /* An alarm tile is red the whole time it is up and pulses deeper, rather
+     than pulsing up from white. The widget redraws every few seconds and the
+     browser stops animating a background tab altogether, so an alarm that
+     reads only in the animation is an alarm that can be missed standing
+     still. Duration matches FLASH_CYCLE, which sets the phase. */
+  .tile.alarm {background: #ffd9d9; border-color: #e88a8a;
+               animation: alarm 1.1s ease-in-out infinite;}
   @keyframes alarm {
-    0%, 100% {background: #ffffff; border-color: #e3e5e8;}
-    50%      {background: #ffb4b4; border-color: #e88a8a;}
+    0%, 100% {background: #ffd9d9; border-color: #e88a8a;}
+    50%      {background: #ff8f8f; border-color: #d05a5a;}
   }
   .status {font-size: 10px; color: #7b8189; text-align: center;
            padding: 5px 0 0; line-height: 1.5;}
@@ -403,11 +417,18 @@ def compute_boat(b: pd.DataFrame) -> dict:
     diff = _last(wd.RUD_DIFF).abs()
     if not diff.empty:
         r["rud_diff"] = float(diff.iloc[-1])
-        # Zero differential only reads as a fault when the boat is settled in a
-        # straight line at speed -- it rests on zero through manoeuvres and
-        # whenever the boat is not pressed up.
-        r["rud_alarm"] = (_straight_and_fast(b)
-                          and held(diff <= RUD_DIFF_ZERO, RUD_DIFF_DWELL))
+        # Zero differential only reads as a fault at speed -- it rests on zero
+        # whenever the boat is not pressed up. Above the threshold it is a
+        # fault in any situation, manoeuvres included, so speed is the only
+        # gate. Both conditions have to hold together for the dwell: a burst
+        # of zero either side of a slow patch does not add up to an alarm.
+        # The reading dithers across the band a sample at a time, so a stray
+        # sample counts for nothing until it has stayed above for the break
+        # time -- both before the alarm is up, where it would otherwise keep
+        # restarting the dwell, and after, where it would drop the tile.
+        zero = bridge((diff <= RUD_DIFF_ZERO) & _fast(b, diff.index),
+                      RUD_DIFF_BREAK, hard=diff > RUD_DIFF_BREAK_DEG)
+        r["rud_alarm"] = held(zero, RUD_DIFF_DWELL)
 
     pitch = _last(wd.PITCH)
     if not pitch.empty:
@@ -430,14 +451,20 @@ def _under_way(b: pd.DataFrame) -> bool:
     return not sog.empty and float(sog.iloc[-1]) >= SAILING_KMH
 
 
-def _straight_and_fast(b: pd.DataFrame) -> bool:
-    """True once the boat has held a straight line above the speed threshold
-    for RUD_ALARM_QUALIFY."""
-    if wd.SOG not in b.columns or wd.YAW_RATE not in b.columns:
-        return False
-    yaw = b[wd.YAW_RATE].abs().rolling(YAW_SMOOTH).mean()
-    ok = (b[wd.SOG] > RUD_ALARM_KMH) & (yaw <= RUD_ALARM_YAW)
-    return held(ok.fillna(False), RUD_ALARM_QUALIFY)
+def _fast(b: pd.DataFrame, idx: pd.Index) -> pd.Series:
+    """Was the boat above the differential alarm speed, sample by sample, on
+    `idx`?
+
+    Speed and differential arrive on their own rows, so the speed is carried
+    forward onto the differential's timestamps. Anywhere the speed is unknown
+    the answer is False rather than assumed, so a gap cannot raise the alarm.
+    """
+    if wd.SOG not in b.columns:
+        return pd.Series(False, index=idx)
+    sog = b[wd.SOG].dropna()
+    if sog.empty:
+        return pd.Series(False, index=idx)
+    return (sog.reindex(idx, method="ffill") > RUD_ALARM_KMH).fillna(False)
 
 
 def _camber_pct(b: pd.DataFrame, camber: pd.Series) -> dict:
@@ -575,11 +602,23 @@ def _range(hi, lo, dp: int = 0, unit: str = "&deg;") -> str:
             f"<span>{_signed(lo, dp, unit)}</span></div>")
 
 
+def _flash_phase() -> str:
+    """Where in the flash a tile drawn right now should start.
+
+    Every redraw replaces the tile with a new element, and a new element starts
+    its animation from the first keyframe -- so without this the pulse resets
+    to its palest point several times a second and never reads as a rhythm. A
+    negative delay taken from the clock picks the cycle up where it should be.
+    """
+    return f"-{time.time() % FLASH_CYCLE:.2f}s"
+
+
 def _tile(label: str, value: str, bg: str = "#ffffff", wide=False, small=False,
           extra: str = "", alarm=False, sub: str = "") -> str:
     # An alarm tile animates its own background, so leave the inline colour off
-    # and let the keyframes own it.
-    style = "" if alarm else f" style='background:{bg}'"
+    # and let the keyframes own it -- carrying only the phase to start at.
+    style = (f" style='animation-delay:{_flash_phase()}'" if alarm
+             else f" style='background:{bg}'")
     classes = "tile" + (" wide" if wide else "") + (" alarm" if alarm else "")
     return (f"<div class='{classes}'{style}>"
             f"<div class='lbl'>{label}</div>"

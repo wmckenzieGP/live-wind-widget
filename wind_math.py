@@ -134,6 +134,44 @@ def sustained_extremes(s: pd.Series, dwell: pd.Timedelta) -> tuple[float, float]
     return float(roll_max[keep].min()), float(roll_min[keep].max())
 
 
+def bridge(flag: pd.Series, gap: pd.Timedelta,
+           hard: pd.Series | None = None) -> pd.Series:
+    """Fill False runs shorter than `gap`, so a flag only breaks when it stays
+    broken.
+
+    A sensor resting on its threshold flicks over it a sample or two at a time.
+    Those pokes are not the signal changing state, but a dwell built on the raw
+    flag treats each one as both an ending and a fresh start -- so a reading
+    that sits on the limit for a minute never qualifies, and one that has
+    qualified keeps dropping out. Bridging them means an excursion has to last
+    `gap` before it counts as anything, on the way up and on the way down
+    alike.
+
+    An excursion is measured to the sample that ends it, and one still running
+    at the end of the data is measured against the time it has served so far --
+    it has not been confirmed yet, so the flag holds.
+
+    `hard` marks samples that are too far out to be dither. An excursion
+    containing one is real however brief, and is never bridged. Without that
+    the rule cuts both ways: bridging a signal that genuinely straddles the
+    threshold welds the halves into a run that qualifies, and the flag then
+    holds through the excursion that follows.
+    """
+    if flag.empty:
+        return flag
+    v = flag.to_numpy(dtype=bool).copy()
+    idx = flag.index
+    edges = np.flatnonzero(np.diff(v.astype(np.int8)))
+    out = None if hard is None else hard.to_numpy(dtype=bool)
+    for start, stop in zip(np.r_[0, edges + 1], np.r_[edges + 1, len(v)]):
+        if v[start] or (out is not None and out[start:stop].any()):
+            continue
+        span = (idx[stop] if stop < len(v) else idx[-1]) - idx[start]
+        if span < gap:
+            v[start:stop] = True
+    return pd.Series(v, index=idx)
+
+
 def held(flag: pd.Series, dwell: pd.Timedelta) -> bool:
     """True if `flag` is currently True and has been for at least `dwell`."""
     if flag.empty or not bool(flag.iloc[-1]):
