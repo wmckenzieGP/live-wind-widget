@@ -171,8 +171,10 @@ figure assumes the machine clock is synced.
 ### Height trace
 
 Under the two counters sit two plots — **Port Height** and **Stbd Height** — each
-showing the last **15 seconds** of raw board height. They exist to answer one
-question: how far behind the boat is the data?
+showing the last **60 seconds** of raw board height — the same rolling minute the
+movement counter above them is drawn from, so the trace covers the whole window
+the count is made of. They exist to answer one question: how far behind the boat
+is the data?
 
 They read off the *same* session-state buffer as the counter, in the same 200 ms
 buckets, on the same 500 ms tick. No extra query, no second connection, and
@@ -185,7 +187,7 @@ board move on the water, watch the trace move, and the difference between them i
 the number you are after. Each plot also states it: `0.4s behind`, per channel, so
 one sensor dropping out while the other reports is visible. Amber past 3 s.
 
-Two more things the plots are deliberate about:
+Three more things the plots are deliberate about:
 
 - **The line breaks across a hole in the feed** rather than drawing through it.
   A clean line across a dropout would read as data and would hide exactly what is
@@ -195,12 +197,18 @@ Two more things the plots are deliberate about:
   against each other. Autoscaling would be actively misleading here: a parked board
   measures 0.5 mm peak to peak, and rescaling to that turns sensor noise into a
   mountain range. The domain grows only if the data runs outside it.
+- **The y-axis is inverted.** The sensor reads larger the further down the board
+  goes, so plotted the usual way up a *lowering* board draws a *rising* line. The
+  axis is flipped so the stroke slopes the way the board travels: a raise runs up
+  the plot, a lower runs down it. Only the mapping to screen y is flipped — the
+  samples, the per-channel readouts and the movement counter are all still real
+  millimetres.
 
 Drawn as inline SVG rather than through a charting library — a Vega or Matplotlib
 figure inside a fragment that reruns every second would cost more render time than
 the query it is meant to be measuring.
 
-Both plots read the buffer, so they work unchanged in replay, showing the 15 s
+Both plots read the buffer, so they work unchanged in replay, showing the minute
 behind the virtual clock.
 
 ## Replay clock

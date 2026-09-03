@@ -89,15 +89,26 @@ BOARD_THRESH_MM = 200.0
 # Past this the buffer is too stale to extend, so refill it outright.
 BOARD_REFILL_GAP = pd.Timedelta("20s")
 
-# Board height trace. The last 15 s of raw height, off the same buffer and the
-# same 200 ms buckets the counter runs on -- no extra query, and nothing here
-# can disagree with the tiles above it because it is the same samples.
+# Board height trace. The last minute of raw height, off the same buffer and
+# the same 200 ms buckets the counter runs on -- no extra query, and nothing
+# here can disagree with the tiles above it because it is the same samples.
+# A minute is also exactly the counter's own rolling window, so the trace now
+# shows the whole span the movement count is drawn from rather than the tail
+# of it.
+#
+# Drawn inverted: the sensor reads larger as the board goes further down, so
+# plotted the usual way up a lowering board draws a rising line. Flipping the
+# y-axis makes the line go the way the board goes -- a raise runs up the plot,
+# a lower runs down it -- which is the only reading a sailor should have to do
+# on a glance-at diagnostic. The samples themselves are untouched; only the
+# mapping to screen y is flipped, so the readouts and the movement counter
+# stay in real millimetres.
 #
 # The x-axis is pinned to the wall clock, not to the newest sample, so the gap
 # between the end of the trace and the right edge IS the feed lag. Watch the
 # boat move, watch the trace move, and the difference between them is the thing
 # being measured. Anchoring to the newest sample would hide it.
-TRACE_WINDOW = pd.Timedelta("15s")
+TRACE_WINDOW = pd.Timedelta("60s")
 TRACE_GAP = pd.Timedelta("1s")     # a hole bigger than this breaks the line
 TRACE_W, TRACE_H = 436, 54         # SVG user units; CSS scales it to the tile
 # Breathing room top and bottom. A parked board sits at the end of its travel,
@@ -184,7 +195,7 @@ st.markdown("""
          font-variant-numeric: tabular-nums; text-transform: none;}
   .tlag {font-variant-numeric: tabular-nums; text-transform: none;}
   .trace svg {display: block; width: 100%; height: auto;}
-  /* One shared x-axis under the pair -- both plots span the same 15 s. */
+  /* One shared x-axis under the pair -- both plots span the same 60 s. */
   .taxis {display: flex; justify-content: space-between; font-size: 9px;
           font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
           color: #9aa0a6; padding: 3px 8px 0;}
@@ -740,13 +751,16 @@ def trace_segments(v: pd.Series, now: pd.Timestamp,
     """
     t0, span, rng = now - TRACE_WINDOW, TRACE_WINDOW.total_seconds(), hi - lo
     plot_h = TRACE_H - 2 * TRACE_PAD
+    # Inverted y: big millimetre readings sit at the bottom, so the stroke
+    # slopes the way the board travels. Screen y already grows downward, so
+    # this is the fraction used directly rather than 1 - fraction.
     segs, cur, prev = [], [], None
     for ts, mm in v.items():
         if prev is not None and ts - prev > TRACE_GAP:
             segs.append(cur)
             cur = []
         x = min(max((ts - t0).total_seconds() / span, 0.0), 1.0) * TRACE_W
-        y = TRACE_PAD + (1.0 - min(max((mm - lo) / rng, 0.0), 1.0)) * plot_h
+        y = TRACE_PAD + min(max((mm - lo) / rng, 0.0), 1.0) * plot_h
         cur.append(f"{x:.1f},{y:.1f}")
         prev = ts
     segs.append(cur)
@@ -790,7 +804,9 @@ def trace_svg(v: pd.Series, colour: str, label: str,
 
     return (
         f"<svg viewBox='0 0 {TRACE_W} {TRACE_H}' preserveAspectRatio='none' "
-        f"role='img' aria-label='{label} over the last 15 seconds'>"
+        f"role='img' aria-label='{label} over the last "
+        f"{TRACE_WINDOW.total_seconds():.0f} seconds, plotted inverted so the "
+        f"line slopes the way the board moves'>"
         + gap
         + f"<g stroke='#eef0f2' stroke-width='1' vector-effect='non-scaling-stroke'>"
         + grid + "</g>"
@@ -829,8 +845,10 @@ def render_traces(buf: pd.DataFrame, now: pd.Timestamp) -> str:
     lo, hi = trace_domain(p, s)
     return (trace_tile("Port Height", p, PORT_LINE, now, lo, hi)
             + trace_tile("Stbd Height", s, STBD_LINE, now, lo, hi)
-            + f"<div class='taxis'><span>-15s</span>"
-              f"<span>{lo:,.0f}&ndash;{hi:,.0f} mm</span><span>now</span></div>")
+            + f"<div class='taxis'>"
+              f"<span>-{TRACE_WINDOW.total_seconds():.0f}s</span>"
+              f"<span>{lo:,.0f}&ndash;{hi:,.0f} mm, up = raise</span>"
+              f"<span>now</span></div>")
 
 
 def status_bits(r: dict, tag: str, vnow: pd.Timestamp | None,
