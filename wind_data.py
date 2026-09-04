@@ -29,9 +29,12 @@ FEED_ERRORS = (psycopg2.OperationalError, psycopg2.InterfaceError,
                psycopg2.pool.PoolError, TSDBTimeout)
 
 TOP_MARKS = ["WG1", "WG2"]        # windward gate
+MID_MARKS = ["M1"]                # course centre
 BOTTOM_MARKS = ["LG1", "LG2"]     # leeward gate
-COURSE_WIND_MARKS = ["WG1", "WG2", "LG1", "LG2", "M1"]
-ALL_MARKS = ["WG1", "WG2", "LG1", "LG2", "M1", "SL1", "SL2"]
+# Course order, top to bottom -- so a list of marks reads down the course
+# wherever one is printed.
+COURSE_WIND_MARKS = TOP_MARKS + MID_MARKS + BOTTOM_MARKS
+ALL_MARKS = COURSE_WIND_MARKS + ["SL1", "SL2"]
 
 TWD = "TWD_MDSS_deg"
 TWS = "TWS_MDSS_km_h_1"

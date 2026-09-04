@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 import time
+from typing import NamedTuple
 
 import pandas as pd
 import streamlit as st
@@ -225,6 +226,13 @@ def fetch_live(now: pd.Timestamp, sma: pd.Timedelta):
     return wd.parallel(
         # Only the five course marks carry wind we use; SL1/SL2 would be a
         # third more data over the wire for nothing.
+        #
+        # All five, whatever is selected in Settings -- the mark selection is
+        # applied in `compute`, not here. Narrowing the query instead would
+        # invalidate the replay block cache and the 30 min range buffer every
+        # time a pill is touched, so a mark switched back on would read dashes
+        # until the next refetch. One mark's worth of rows is the cheaper side
+        # of that trade.
         lambda: wd.fetch_wind(now - _lookback(sma), now, wd.COURSE_WIND_MARKS),
         lambda: wd.fetch_boat(now - BOAT_WINDOW, now),
         lambda: wd.fetch_positions(now - pd.Timedelta("10min"), now),
@@ -273,11 +281,42 @@ def _upto(df: pd.DataFrame, when: pd.Timestamp) -> pd.DataFrame:
 # Metrics
 # ---------------------------------------------------------------------------
 
-def compute(twd: pd.DataFrame, tws: pd.DataFrame, pos: dict, sma: pd.Timedelta) -> dict:
+class WindMarks(NamedTuple):
+    """Which marks' wind feeds the averages, chosen in Settings.
+
+    A mark can stream bad TWD or TWS while the rest of the course is fine, and
+    an average has no way to notice: one bad mark just drags the number every
+    tile is read against. Dropping it for the day is better than reading past
+    it, and the pills go back on when the mark does.
+
+    Wind only. A mark's position stays good when its wind does not, and the
+    course axis and the gate bias are pure geometry -- they keep using both
+    marks of a pair whatever is selected here, so dropping a mark never costs
+    a bias.
+    """
+    top: list[str]
+    mid: list[str]
+    bottom: list[str]
+
+    @property
+    def course(self) -> list[str]:
+        """The marks behind the course average, in course order."""
+        return self.top + self.mid + self.bottom
+
+    @property
+    def excluded(self) -> list[str]:
+        return [m for m in wd.COURSE_WIND_MARKS if m not in self.course]
+
+
+ALL_WIND_MARKS = WindMarks(wd.TOP_MARKS, wd.MID_MARKS, wd.BOTTOM_MARKS)
+
+
+def compute(twd: pd.DataFrame, tws: pd.DataFrame, pos: dict, sma: pd.Timedelta,
+            marks: WindMarks) -> dict:
     r = {"axis": float("nan"), "deployed": False, "separation": float("nan"),
          "course_twd": float("nan"), "course_tws": float("nan"),
          "top_bias": None, "bottom_bias": None,
-         "missing": [], "latest": None}
+         "missing": [], "excluded": marks.excluded, "latest": None}
 
     # Course axis: bottom gate midpoint -> top gate midpoint.
     lg = midpoint([pos[m] for m in wd.BOTTOM_MARKS if m in pos])
@@ -292,26 +331,29 @@ def compute(twd: pd.DataFrame, tws: pd.DataFrame, pos: dict, sma: pd.Timedelta) 
     if twd.empty:
         return r
     r["latest"] = twd.index[-1]
-    r["missing"] = [m for m in wd.COURSE_WIND_MARKS if m not in twd.columns]
+    # Only the selected marks; a mark switched off deliberately is not missing.
+    r["missing"] = [m for m in marks.course if m not in twd.columns]
 
-    # Course wind: average the five marks, then a simple moving average.
-    cols = [m for m in wd.COURSE_WIND_MARKS if m in twd.columns]
+    # Course wind: average the selected marks, then a simple moving average.
+    cols = [m for m in marks.course if m in twd.columns]
     if cols:
         r["course_twd"] = circular_sma(circular_mean_columns(twd[cols]), sma).iloc[-1]
-    cols_s = [m for m in wd.COURSE_WIND_MARKS if m in tws.columns]
+    cols_s = [m for m in marks.course if m in tws.columns]
     if cols_s and not tws.empty:
         r["course_tws"] = tws[cols_s].mean(axis=1).rolling(sma).mean().iloc[-1]
 
-    # Gates: average the pair, then a 20 s EMA.
-    for key, marks in (("top", wd.TOP_MARKS), ("bottom", wd.BOTTOM_MARKS)):
-        c = [m for m in marks if m in twd.columns]
+    # Gates: average the selected marks of the pair, then a 20 s EMA. The bias
+    # takes the whole gate either way -- that is geometry, not wind.
+    for key, gate, wind in (("top", wd.TOP_MARKS, marks.top),
+                            ("bottom", wd.BOTTOM_MARKS, marks.bottom)):
+        c = [m for m in wind if m in twd.columns]
         r[f"{key}_twd"] = (circular_ema(circular_mean_columns(twd[c]), EMA_HALFLIFE).iloc[-1]
                            if c else float("nan"))
-        cs = [m for m in marks if m in tws.columns]
+        cs = [m for m in wind if m in tws.columns]
         r[f"{key}_tws"] = (tws[cs].mean(axis=1).ewm(halflife=EMA_HALFLIFE, times=tws.index)
                            .mean().iloc[-1] if cs and not tws.empty else float("nan"))
         r[f"{key}_offset"] = signed_diff(r[f"{key}_twd"], r["course_twd"])
-        r[f"{key}_bias"] = gate_bias(pos, marks, r[f"{key}_twd"],
+        r[f"{key}_bias"] = gate_bias(pos, gate, r[f"{key}_twd"],
                                      upwind=(key == "top"),
                                      deployed=r["deployed"])
     return r
@@ -365,7 +407,7 @@ def square_to(pts: list[tuple[float, float]], twd: float) -> float:
 
 
 def wind_range(twd: pd.DataFrame, tws: pd.DataFrame,
-               ref_twd: float, ref_tws: float) -> dict:
+               ref_twd: float, ref_tws: float, marks: WindMarks) -> dict:
     """How far the wind has swung either side of the displayed averages.
 
     Reported as signed deviations from the averages, so they read directly
@@ -376,7 +418,7 @@ def wind_range(twd: pd.DataFrame, tws: pd.DataFrame,
     def _window(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return df
-        cols = [m for m in wd.COURSE_WIND_MARKS if m in df.columns]
+        cols = [m for m in marks.course if m in df.columns]
         if not cols:
             return pd.DataFrame()
         df = df[cols]
@@ -868,6 +910,9 @@ def status_bits(r: dict, tag: str, vnow: pd.Timestamp | None,
         bits.append(f"gate {r['separation']:.0f} m")
     if r["missing"]:
         bits.append(f"<span class='warn'>missing {', '.join(r['missing'])}</span>")
+    # A mark held out of the averages has to be visible on the frame it changed.
+    if r["excluded"]:
+        bits.append(f"<span class='warn'>{', '.join(r['excluded'])} off</span>")
     bits.append(tag)
     return bits
 
@@ -923,8 +968,28 @@ if mode == "Replay":
             ss.update(playing=True, wall=time.time())
         st.rerun()
 
+
+def mark_pills(label: str, options: list[str], key: str) -> list[str]:
+    """A pill per mark, all on by default.
+
+    Normalised back to course order, so the order a user happened to click in
+    never leaks into the column lists downstream.
+    """
+    sel = st.pills(label, options, selection_mode="multi", default=options,
+                   key=key) or []
+    return [m for m in options if m in sel]
+
+
 with st.expander("Settings"):
     sma_min = st.slider("Course average (minutes)", 1, 20, 10, key="sma")
+    st.caption("Wind marks &mdash; deselect one that is not reporting properly. "
+               "Positions are unaffected: the axis and the gate bias still use "
+               "the whole gate.", unsafe_allow_html=True)
+    wind_marks = WindMarks(
+        top=mark_pills("Top gate", wd.TOP_MARKS, "mk_top"),
+        mid=mark_pills("Mid course", wd.MID_MARKS, "mk_mid"),
+        bottom=mark_pills("Bottom gate", wd.BOTTOM_MARKS, "mk_bottom"),
+    )
 sma = pd.Timedelta(minutes=sma_min)
 
 
@@ -975,8 +1040,8 @@ def feed_diag() -> None:
 
 def blank_wind() -> str:
     """An all-dashes frame, for a feed that has never once answered."""
-    return render(compute(pd.DataFrame(), pd.DataFrame(), {}, sma), {},
-                  compute_boat(pd.DataFrame()), sma_min)
+    return render(compute(pd.DataFrame(), pd.DataFrame(), {}, sma, wind_marks),
+                  {}, compute_boat(pd.DataFrame()), sma_min)
 
 
 def draw():
@@ -986,16 +1051,17 @@ def draw():
             if mode == "Live":
                 now = pd.Timestamp.utcnow().tz_localize(None)
                 (twd, tws), boat, pos = fetch_live(now, sma)
-                r = compute(twd, tws, pos, sma)
-                rng = live_range(now, r)
+                r = compute(twd, tws, pos, sma, wind_marks)
+                rng = live_range(now, r, wind_marks)
                 vnow, tag, replay = now, "live", False
             else:
                 vnow = virtual_now()
                 twd, tws, boat, pos = fetch_replay(vnow, sma)
-                r = compute(twd, tws, pos, sma)
+                r = compute(twd, tws, pos, sma, wind_marks)
                 # Replay already holds the whole window in the cached block, so
                 # there is nothing to throttle.
-                rng = wind_range(twd, tws, r["course_twd"], r["course_tws"])
+                rng = wind_range(twd, tws, r["course_twd"], r["course_tws"],
+                                 wind_marks)
                 tag = "replay &#9654;" if ss["playing"] else "replay &#9208;"
                 replay = True
 
@@ -1046,7 +1112,7 @@ def draw_boards():
                 + status_line(bits + feed_bits()), unsafe_allow_html=True)
 
 
-def live_range(now: pd.Timestamp, r: dict) -> dict:
+def live_range(now: pd.Timestamp, r: dict, marks: WindMarks) -> dict:
     """Refetch the 30 min window on its own slow cadence; between refreshes
     re-derive the deviations from the frame already in hand, so the + and -
     stay honest as the average underneath them drifts."""
@@ -1058,7 +1124,7 @@ def live_range(now: pd.Timestamp, r: dict) -> dict:
     if ss["range_twd"] is None:
         return {}
     return wind_range(ss["range_twd"], ss["range_tws"],
-                      r["course_twd"], r["course_tws"])
+                      r["course_twd"], r["course_tws"], marks)
 
 
 if mode == "Live":

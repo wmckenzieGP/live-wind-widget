@@ -22,6 +22,29 @@ The two gate TWD tiles are shaded by their offset from the course TWD: white
 within ±2°, pale red when left of the course wind, pale green when right,
 saturating gently and clamping at ±15°. Text is always black.
 
+### Choosing the marks
+
+A mark can stream bad TWD or TWS while the rest of the course is fine, and an
+average has no way to notice — one bad mark just drags the number every tile is
+read against. **Settings → Wind marks** has a pill per mark, grouped Top / Mid /
+Bottom, all on by default. Deselect one and it drops out of the course average
+and out of the gate above it; select it again and it is back on the next tick.
+The status line carries e.g. `WG2 off` in amber for as long as anything is
+deselected, so a held-back mark is never invisible on the frame it changed.
+
+**Wind only.** A mark's position stays good when its wind does not, so the
+course axis and both gate biases are unaffected — they are pure geometry and
+keep using both marks of a pair whatever is selected. Deselecting a mark
+therefore never costs a bias; it only stops that mark's wind feeding the
+averages. Deselect *both* marks of a gate and that gate's TWD/TWS read dashes,
+and its bias goes with them (a bias needs a wind direction to be read against).
+
+The query still fetches all five course marks whatever is selected — the filter
+is applied when the metrics are computed. Narrowing the query instead would
+invalidate the replay block cache and the 30-minute range buffer every time a
+pill is touched, so a mark switched back on would read dashes until the next
+refetch. One mark's worth of rows is the cheaper side of that trade.
+
 ### Range
 
 The Course TWD and TWS tiles carry a small `+` / `−` pair on the right: how far
