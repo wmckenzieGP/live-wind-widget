@@ -25,7 +25,9 @@ from wind_math import (bearing, board_movements, bridge, circular_ema,
 
 EMA_HALFLIFE = pd.Timedelta("20s")
 FLASH_CYCLE = 1.1                 # seconds; keep in step with the alarm CSS
-LIVE_REFRESH_S = 3
+# Wind, gate bias and boat trim. The leading-edge query is the fast one, so
+# the tick can sit inside it and still land a fresh frame every time.
+LIVE_REFRESH_S = 2
 REPLAY_TICK_S = 1
 REPLAY_BLOCK = pd.Timedelta("10min")
 # Most recent session with marks deployed (see README).
@@ -1045,7 +1047,8 @@ def blank_wind() -> str:
 
 
 def draw():
-    """Wind and boat trim. Slower cadence -- none of it changes in a second."""
+    """Wind, gate bias and boat trim. Slower cadence than the board counter --
+    none of it moves fast enough to be worth a half-second tick."""
     if feed_ready():
         try:
             if mode == "Live":

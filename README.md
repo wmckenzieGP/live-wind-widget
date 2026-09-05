@@ -242,7 +242,7 @@ shows the timestamp of the newest data instead.
 
 ## Modes
 
-**Live** — queries TimescaleDB every 3 s with no caching or buffering, so the
+**Live** — queries TimescaleDB every 2 s with no caching or buffering, so the
 leading edge is always current. Each poll re-reads the whole trailing window,
 which is stateless and cannot drift or gap.
 
