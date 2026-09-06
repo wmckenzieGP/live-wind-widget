@@ -36,10 +36,13 @@ DEFAULT_REPLAY = dt.datetime(2026, 6, 21, 17, 0, 0)
 # Wind range: how far back to look, and how long a shift must hold to count.
 RANGE_WINDOW = pd.Timedelta("30min")
 RANGE_DWELL = pd.Timedelta("3s")
-# The 30 min query costs ~14 s against ~9 s for the leading edge, so it runs on
-# its own slow cadence rather than on every poll. A half-hour statistic does
-# not move meaningfully in 30 s.
+# A half-hour statistic does not move meaningfully in 30 s, so the window is
+# refreshed on its own slow cadence rather than on every poll -- and refreshed
+# by extending it, not re-reading it (see `range_buffer`).
 RANGE_REFRESH_S = 30
+# Bigger hole than this and the buffer is spliced across a gap it cannot vouch
+# for, so it starts clean instead. One refresh interval plus slack.
+RANGE_REFILL_GAP = pd.Timedelta("90s")
 
 # Boat.
 BOAT_WINDOW = pd.Timedelta("60s")
@@ -244,6 +247,11 @@ def fetch_live(now: pd.Timestamp, sma: pd.Timedelta):
 def fetch_live_range(now: pd.Timestamp):
     """The 30 min window behind the leading edge, course marks only."""
     return wd.fetch_wind(now - _range_lookback(), now, wd.COURSE_WIND_MARKS)
+
+
+def fetch_range_tail(after: pd.Timestamp, now: pd.Timestamp):
+    """Only what has landed since the buffer's last sample."""
+    return wd.fetch_wind(after, now, wd.COURSE_WIND_MARKS)
 
 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=32)
@@ -1115,16 +1123,64 @@ def draw_boards():
                 + status_line(bits + feed_bits()), unsafe_allow_html=True)
 
 
+def _splice(old: pd.DataFrame, new: pd.DataFrame,
+            keep: pd.Timedelta) -> pd.DataFrame:
+    """Extend a rolling window with a newly fetched tail.
+
+    The tail is refetched from the buffer's last sample, so the two overlap by
+    a bucket: that bucket was partial when it was first read and complete now,
+    and `keep="last"` is what takes the finished version. A mark that appeared
+    or dropped out mid-window aligns to NaN in the rows it was absent for,
+    exactly as a full refetch would have left it.
+    """
+    if new is not None and not new.empty:
+        old = pd.concat([old, new])
+        old = old[~old.index.duplicated(keep="last")].sort_index()
+    if old.empty:
+        return old
+    return old[old.index >= old.index[-1] - keep]
+
+
+def range_buffer(now: pd.Timestamp) -> bool:
+    """Hold the 30 min window in session state and extend it a tail at a time.
+
+    The whole window is 3300-odd rows and re-reading it cost ~0.8 s on the
+    script thread every 30 s. Every fragment shares that thread, so the board
+    counter could not tick while it ran -- and the counter is the one number
+    here that has to track real time. A tail is ~0.3 s and a fiftieth of the
+    rows, for an identical frame.
+
+    Returns whether a usable window is in hand.
+    """
+    twd, tws = ss["range_twd"], ss["range_tws"]
+    keep = _range_lookback()
+    if twd is None or twd.empty:
+        twd, tws = fetch_live_range(now)
+    else:
+        last = twd.index[-1]
+        gap = now - last
+        if gap > RANGE_REFILL_GAP or gap < pd.Timedelta(0):
+            # Feed dropped, or the clock moved under us: start clean rather
+            # than weld the two sides of a hole together.
+            twd, tws = fetch_live_range(now)
+        else:
+            new_twd, new_tws = fetch_range_tail(last, now)
+            twd = _splice(twd, new_twd, keep)
+            tws = _splice(tws, new_tws, keep)
+    ss["range_twd"], ss["range_tws"] = twd, tws
+    return twd is not None and not twd.empty
+
+
 def live_range(now: pd.Timestamp, r: dict, marks: WindMarks) -> dict:
-    """Refetch the 30 min window on its own slow cadence; between refreshes
+    """Refresh the 30 min window on its own slow cadence; between refreshes
     re-derive the deviations from the frame already in hand, so the + and -
     stay honest as the average underneath them drifts."""
     due = (ss["range_at"] is None
            or now - ss["range_at"] >= pd.Timedelta(seconds=RANGE_REFRESH_S))
     if due:
-        ss["range_twd"], ss["range_tws"] = fetch_live_range(now)
-        ss["range_at"] = now
-    if ss["range_twd"] is None:
+        if range_buffer(now):
+            ss["range_at"] = now
+    if ss["range_twd"] is None or ss["range_twd"].empty:
         return {}
     return wind_range(ss["range_twd"], ss["range_tws"],
                       r["course_twd"], r["course_tws"], marks)
@@ -1137,7 +1193,15 @@ elif ss["playing"]:
 else:
     every = board_every = None   # paused: hold the frame, no polling
 
-# Two timers. The board counter is the one metric where a second matters, so it
-# redraws twice as often as the wind and never waits on the wind queries.
+# Two timers. The board counter is the one metric where a fraction of a second
+# matters, so it redraws on its own tick rather than at the wind's cadence.
+#
+# The two are not independent, though: Streamlit runs one script thread per
+# session and takes fragment reruns one at a time, so whatever the wind poll is
+# doing, the board tick waits behind it. That is why the work inside `draw` is
+# kept short -- the leading-edge queries go out together (~0.5 s), and the 30
+# min window is extended by a tail rather than re-read (~0.3 s, against ~1.6 s
+# for the full window). Time spent in the wind fragment is latency on the board
+# counter, so anything added there is paid for twice.
 st.fragment(run_every=every)(draw)()
 st.fragment(run_every=board_every)(draw_boards)()

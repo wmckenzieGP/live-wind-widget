@@ -62,9 +62,18 @@ Direction is done circularly — the deviation from the average is taken with
 `signed_diff` first, so a range spanning 0°/360° behaves. If nothing was
 sustained on a side, that side reads zero rather than an inverted range.
 
-The 30-minute query costs ~14 s against ~9 s for the leading edge, so it runs
-on its own 30 s cadence (`RANGE_REFRESH_S`) rather than on every poll; the
-deviations are re-derived against the current average in between.
+The window runs on its own 30 s cadence (`RANGE_REFRESH_S`) rather than on
+every poll; the deviations are re-derived against the current average in
+between, so the + and - follow the big numbers at the full refresh rate.
+
+It is also **extended rather than re-read**. Re-querying the whole window cost
+~1.6 s and 3,300 rows every 30 s; fetching only the tail since the last sample
+costs ~0.3 s and ~30 rows for a frame that is identical row for row (the
+overlapping bucket is taken from the newer read, which is the complete one).
+That matters because every fragment shares one script thread — see
+[Refresh timing](#refresh-timing). A gap longer than `RANGE_REFILL_GAP`, or a
+clock that moves backwards, refetches the whole window rather than splicing
+across a hole.
 
 ## Boat metrics (NZL)
 
@@ -245,6 +254,23 @@ shows the timestamp of the newest data instead.
 **Live** — queries TimescaleDB every 2 s with no caching or buffering, so the
 leading edge is always current. Each poll re-reads the whole trailing window,
 which is stateless and cannot drift or gap.
+
+### Refresh timing
+
+Streamlit runs **one script thread per session** and takes fragment reruns one
+at a time, so the two timers are not independent: while the wind fragment is
+querying, the board tick waits. Keeping `draw` short is therefore what keeps the
+board counter close to real time, and the budget looks like this:
+
+| Work | Cost | Cadence |
+|---|---|---|
+| Leading edge (wind + boat + positions, concurrent) | ~0.5 s | 2 s |
+| 30 min range, tail only | ~0.3 s | 30 s |
+| 30 min range, full window *(only after a gap)* | ~1.6 s | rare |
+| Board tick (incremental height) | ~0.28 s | 500 ms |
+
+Anything added to the wind fragment is paid for twice — once as its own latency
+and once as jitter on the board counter.
 
 **Replay** — pick any date/time (UTC) and press play; it runs forward at normal
 speed through the identical calculation path. Replay prefetches in 10-minute
