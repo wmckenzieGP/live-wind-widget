@@ -17,6 +17,7 @@ from typing import NamedTuple
 import pandas as pd
 import streamlit as st
 
+import live_feed
 import wind_data as wd
 from wind_math import (bearing, board_movements, bridge, circular_ema,
                        circular_mean_columns, circular_sma, distance_m,
@@ -38,8 +39,17 @@ RANGE_WINDOW = pd.Timedelta("30min")
 RANGE_DWELL = pd.Timedelta("3s")
 # A half-hour statistic does not move meaningfully in 30 s, so the window is
 # refreshed on its own slow cadence rather than on every poll -- and refreshed
-# by extending it, not re-reading it (see `range_buffer`).
+# by extending it, not re-reading it (see `live_feed.LiveFeed._range`).
 RANGE_REFRESH_S = 30
+# The worker fetches one window wide enough for any viewer's setting, so the
+# slider can move without a refetch. Keep in step with the slider's maximum.
+MAX_SMA = pd.Timedelta("20min")
+# Marks are anchored buoys; between the times they are physically moved they do
+# not go anywhere, so their positions do not need a query every pass.
+POS_REFRESH_S = 10
+# Miss more of the leading edge than this and the buffer starts clean rather
+# than splicing across a hole.
+EDGE_REFILL_GAP = pd.Timedelta("30s")
 # Bigger hole than this and the buffer is spliced across a gap it cannot vouch
 # for, so it starts clean instead. One refresh interval plus slack.
 RANGE_REFILL_GAP = pd.Timedelta("90s")
@@ -131,6 +141,9 @@ TRACE_LAG_WARN = 3.0               # seconds behind before the readout goes ambe
 # one refused connection becomes a widget that can never reconnect. Hold the
 # last frame, say so, and leave the server alone for a bit.
 FEED_RETRY_S = 10
+# The worker refetches every LIVE_REFRESH_S; past a few missed turns it has
+# stopped bringing anything back and the tiles are holding old numbers.
+WIND_STALE_S = 8.0
 
 st.set_page_config(page_title="Course Wind", page_icon="🌬️",
                    layout="centered", initial_sidebar_state="collapsed")
@@ -226,32 +239,33 @@ def _range_lookback() -> pd.Timedelta:
     return RANGE_WINDOW + RANGE_DWELL + pd.Timedelta("1min")
 
 
-def fetch_live(now: pd.Timestamp, sma: pd.Timedelta):
-    """Direct query, no cache and no buffering -- minimum possible delay."""
-    return wd.parallel(
-        # Only the five course marks carry wind we use; SL1/SL2 would be a
-        # third more data over the wire for nothing.
-        #
-        # All five, whatever is selected in Settings -- the mark selection is
-        # applied in `compute`, not here. Narrowing the query instead would
-        # invalidate the replay block cache and the 30 min range buffer every
-        # time a pill is touched, so a mark switched back on would read dashes
-        # until the next refetch. One mark's worth of rows is the cheaper side
-        # of that trade.
-        lambda: wd.fetch_wind(now - _lookback(sma), now, wd.COURSE_WIND_MARKS),
-        lambda: wd.fetch_boat(now - BOAT_WINDOW, now),
-        lambda: wd.fetch_positions(now - pd.Timedelta("10min"), now),
-    )
+# Live fetching happens on a worker thread -- see live_feed. Only the five
+# course marks carry wind we use; SL1/SL2 would be a third more data over the
+# wire for nothing. All five are fetched whatever is selected in Settings: the
+# mark selection is applied in `compute`, not in the query. Narrowing the query
+# instead would invalidate the replay block cache and the 30 min range buffer
+# every time a pill is touched, so a mark switched back on would read dashes
+# until the next refetch.
 
+@st.cache_resource(show_spinner=False)
+def live_wind() -> live_feed.LiveFeed:
+    """The one worker, shared by every viewer and every rerun.
 
-def fetch_live_range(now: pd.Timestamp):
-    """The 30 min window behind the leading edge, course marks only."""
-    return wd.fetch_wind(now - _range_lookback(), now, wd.COURSE_WIND_MARKS)
-
-
-def fetch_range_tail(after: pd.Timestamp, now: pd.Timestamp):
-    """Only what has landed since the buffer's last sample."""
-    return wd.fetch_wind(after, now, wd.COURSE_WIND_MARKS)
+    `cache_resource` is what keeps it single: this script re-executes top to
+    bottom on every rerun, and without it each pass would start another thread.
+    """
+    return live_feed.LiveFeed(
+        interval_s=LIVE_REFRESH_S,
+        lookback=_lookback(MAX_SMA),
+        boat_window=BOAT_WINDOW,
+        pos_window=pd.Timedelta("10min"),
+        pos_refresh_s=POS_REFRESH_S,
+        refill_gap=EDGE_REFILL_GAP,
+        range_lookback=_range_lookback(),
+        range_refresh_s=RANGE_REFRESH_S,
+        range_refill_gap=RANGE_REFILL_GAP,
+        retry_s=FEED_RETRY_S,
+    ).start()
 
 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=32)
@@ -937,12 +951,10 @@ def status_line(bits: list[str]) -> str:
 
 ss = st.session_state
 ss.setdefault("mode", "Live")
+ss.setdefault("wind_err", None)   # what the worker last reported
 ss.setdefault("playing", False)
 ss.setdefault("elapsed", 0.0)     # seconds of playback consumed
 ss.setdefault("wall", None)       # wall-clock time when play was pressed
-ss.setdefault("range_at", None)   # when the 30 min range window last refreshed
-ss.setdefault("range_twd", None)
-ss.setdefault("range_tws", None)
 ss.setdefault("board_buf", None)  # rolling daggerboard trace
 ss.setdefault("wind_bits", [])    # status from the slow fragment, drawn by the fast one
 ss.setdefault("wind_html", None)  # last good frame, put back up if the feed drops
@@ -991,7 +1003,8 @@ def mark_pills(label: str, options: list[str], key: str) -> list[str]:
 
 
 with st.expander("Settings"):
-    sma_min = st.slider("Course average (minutes)", 1, 20, 10, key="sma")
+    sma_min = st.slider("Course average (minutes)", 1,
+                        int(MAX_SMA.total_seconds() // 60), 10, key="sma")
     st.caption("Wind marks &mdash; deselect one that is not reporting properly. "
                "Positions are unaffected: the axis and the gate bias still use "
                "the whole gate.", unsafe_allow_html=True)
@@ -1033,7 +1046,8 @@ def feed_failed(exc: Exception) -> None:
 
 
 def feed_bits() -> list[str]:
-    return [] if ss["feed_at"] is None else ["<span class='warn'>connection lost</span>"]
+    lost = ss["feed_at"] is not None or ss.get("wind_err")
+    return ["<span class='warn'>connection lost</span>"] if lost else []
 
 
 def feed_diag() -> None:
@@ -1043,9 +1057,10 @@ def feed_diag() -> None:
     copied out in one click: a message nobody can find is the same as no
     message, which is how this started.
     """
-    if ss["feed_msg"]:
-        st.error("Database connection failed")
-        st.code(ss["feed_msg"], language=None)
+    for msg in (ss["feed_msg"], ss.get("wind_err")):
+        if msg:
+            st.error("Database connection failed")
+            st.code(msg, language=None)
 
 
 def blank_wind() -> str:
@@ -1055,34 +1070,17 @@ def blank_wind() -> str:
 
 
 def draw():
-    """Wind, gate bias and boat trim. Slower cadence than the board counter --
-    none of it moves fast enough to be worth a half-second tick."""
-    if feed_ready():
-        try:
-            if mode == "Live":
-                now = pd.Timestamp.utcnow().tz_localize(None)
-                (twd, tws), boat, pos = fetch_live(now, sma)
-                r = compute(twd, tws, pos, sma, wind_marks)
-                rng = live_range(now, r, wind_marks)
-                vnow, tag, replay = now, "live", False
-            else:
-                vnow = virtual_now()
-                twd, tws, boat, pos = fetch_replay(vnow, sma)
-                r = compute(twd, tws, pos, sma, wind_marks)
-                # Replay already holds the whole window in the cached block, so
-                # there is nothing to throttle.
-                rng = wind_range(twd, tws, r["course_twd"], r["course_tws"],
-                                 wind_marks)
-                tag = "replay &#9654;" if ss["playing"] else "replay &#9208;"
-                replay = True
+    """Wind, gate bias and boat trim.
 
-            # The status line is drawn by the board fragment so it sits at the
-            # bottom and, in replay, ticks once a second with the clock.
-            ss["wind_bits"] = status_bits(r, tag, vnow, replay)
-            ss["wind_html"] = render(r, rng, compute_boat(boat), sma_min)
-            ss["feed_at"] = ss["feed_msg"] = None
-        except wd.FEED_ERRORS as e:
-            feed_failed(e)
+    In Live mode this does no querying at all -- it renders whatever the worker
+    has most recently put down, which costs microseconds. That is the whole
+    point: this fragment shares its thread with the board counter, so time
+    spent here is latency on the counter.
+    """
+    if mode == "Live":
+        draw_live()
+    else:
+        draw_replay()
 
     # Called here rather than at the top so it reflects this tick, and still
     # lands above the tiles -- Streamlit draws in call order.
@@ -1092,6 +1090,60 @@ def draw():
     # The wind bits keep the timestamp it was current at, so a held frame is
     # never mistaken for a live one.
     st.markdown(ss["wind_html"] or blank_wind(), unsafe_allow_html=True)
+
+
+def draw_live() -> None:
+    """Render the worker's newest frames. No queries, no blocking."""
+    feed = live_wind()
+    snap = feed.snapshot()
+    # Its own slot, not feed_msg: the board fragment clears that one whenever a
+    # board query succeeds, which would wipe a wind failure the moment it was
+    # reported. The worker owns its own back-off, so this is reported, not
+    # retried -- the next good fetch clears it.
+    ss["wind_err"] = feed.error()
+
+    if snap is None:
+        # Nothing has landed yet -- the first fetch is still in flight.
+        ss["wind_bits"] = ["<span class='warn'>connecting</span>"]
+        return
+
+    r = compute(snap.twd, snap.tws, snap.pos, sma, wind_marks)
+    rng = live_range(snap, r, wind_marks)
+    ss["wind_bits"] = status_bits(r, "live", snap.at, False) + feed_age_bits(feed)
+    ss["wind_html"] = render(r, rng, compute_boat(snap.boat), sma_min)
+
+
+def draw_replay() -> None:
+    """Replay reads the cached block on this thread -- it is already local."""
+    if not feed_ready():
+        return
+    try:
+        vnow = virtual_now()
+        twd, tws, boat, pos = fetch_replay(vnow, sma)
+        r = compute(twd, tws, pos, sma, wind_marks)
+        # Replay already holds the whole window in the cached block, so there
+        # is nothing to throttle.
+        rng = wind_range(twd, tws, r["course_twd"], r["course_tws"], wind_marks)
+        tag = "replay &#9654;" if ss["playing"] else "replay &#9208;"
+        # The status line is drawn by the board fragment so it sits at the
+        # bottom and, in replay, ticks once a second with the clock.
+        ss["wind_bits"] = status_bits(r, tag, vnow, True)
+        ss["wind_html"] = render(r, rng, compute_boat(boat), sma_min)
+        ss["feed_at"] = ss["feed_msg"] = None
+    except wd.FEED_ERRORS as e:
+        feed_failed(e)
+
+
+def feed_age_bits(feed: live_feed.LiveFeed) -> list[str]:
+    """Say so when the worker has stopped bringing anything back.
+
+    Without this a stalled worker looks exactly like a calm day: the tiles hold
+    their last good numbers and nothing on the page contradicts them.
+    """
+    age = feed.age()
+    if age is None or age < WIND_STALE_S:
+        return []
+    return [f"<span class='warn'>wind {age:.0f}s</span>"]
 
 
 def draw_boards():
@@ -1123,66 +1175,16 @@ def draw_boards():
                 + status_line(bits + feed_bits()), unsafe_allow_html=True)
 
 
-def _splice(old: pd.DataFrame, new: pd.DataFrame,
-            keep: pd.Timedelta) -> pd.DataFrame:
-    """Extend a rolling window with a newly fetched tail.
+def live_range(snap: live_feed.Snapshot, r: dict, marks: WindMarks) -> dict:
+    """Deviations against the averages currently on screen.
 
-    The tail is refetched from the buffer's last sample, so the two overlap by
-    a bucket: that bucket was partial when it was first read and complete now,
-    and `keep="last"` is what takes the finished version. A mark that appeared
-    or dropped out mid-window aligns to NaN in the rows it was absent for,
-    exactly as a full refetch would have left it.
+    The worker keeps the 30 min window; this re-derives the + and - from it on
+    every tick, so they stay honest as the average underneath them drifts even
+    though the window itself only refreshes every RANGE_REFRESH_S.
     """
-    if new is not None and not new.empty:
-        old = pd.concat([old, new])
-        old = old[~old.index.duplicated(keep="last")].sort_index()
-    if old.empty:
-        return old
-    return old[old.index >= old.index[-1] - keep]
-
-
-def range_buffer(now: pd.Timestamp) -> bool:
-    """Hold the 30 min window in session state and extend it a tail at a time.
-
-    The whole window is 3300-odd rows and re-reading it cost ~0.8 s on the
-    script thread every 30 s. Every fragment shares that thread, so the board
-    counter could not tick while it ran -- and the counter is the one number
-    here that has to track real time. A tail is ~0.3 s and a fiftieth of the
-    rows, for an identical frame.
-
-    Returns whether a usable window is in hand.
-    """
-    twd, tws = ss["range_twd"], ss["range_tws"]
-    keep = _range_lookback()
-    if twd is None or twd.empty:
-        twd, tws = fetch_live_range(now)
-    else:
-        last = twd.index[-1]
-        gap = now - last
-        if gap > RANGE_REFILL_GAP or gap < pd.Timedelta(0):
-            # Feed dropped, or the clock moved under us: start clean rather
-            # than weld the two sides of a hole together.
-            twd, tws = fetch_live_range(now)
-        else:
-            new_twd, new_tws = fetch_range_tail(last, now)
-            twd = _splice(twd, new_twd, keep)
-            tws = _splice(tws, new_tws, keep)
-    ss["range_twd"], ss["range_tws"] = twd, tws
-    return twd is not None and not twd.empty
-
-
-def live_range(now: pd.Timestamp, r: dict, marks: WindMarks) -> dict:
-    """Refresh the 30 min window on its own slow cadence; between refreshes
-    re-derive the deviations from the frame already in hand, so the + and -
-    stay honest as the average underneath them drifts."""
-    due = (ss["range_at"] is None
-           or now - ss["range_at"] >= pd.Timedelta(seconds=RANGE_REFRESH_S))
-    if due:
-        if range_buffer(now):
-            ss["range_at"] = now
-    if ss["range_twd"] is None or ss["range_twd"].empty:
+    if snap.range_twd is None or snap.range_twd.empty:
         return {}
-    return wind_range(ss["range_twd"], ss["range_tws"],
+    return wind_range(snap.range_twd, snap.range_tws,
                       r["course_twd"], r["course_tws"], marks)
 
 
