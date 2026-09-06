@@ -12,6 +12,7 @@ the wind sits near 0/360. TWS is scalar, so `mean` is fine.
 from __future__ import annotations
 
 import atexit
+from concurrent.futures import ThreadPoolExecutor
 
 import arrow
 import pandas as pd
@@ -299,23 +300,23 @@ def fetch_positions(start, end, marks: list[str] | None = None) -> dict[str, tup
 # ---------------------------------------------------------------------------
 
 def parallel(*calls):
-    """Run zero-argument fetches in order and return their results in order.
+    """Run zero-argument fetches and return their results in order.
 
-    Sequentially, despite the name -- kept because the call sites read as "these
-    go out together", which is still what they mean.
+    Concurrently where the connection budget allows it: each poll needs several
+    independent queries, and run one after another they add up to more than the
+    refresh interval. Nothing here touches Streamlit, so worker threads are
+    safe.
 
-    This used to fan the calls out across the pool on the theory that a cycle
-    would then cost its slowest query instead of their sum. Measured against
-    this server, concurrency is a pessimisation: the poll's three queries cost
-    ~1.98 s run at once against ~1.21 s one after another, where each on its own
-    is ~0.40 s. Three connections asking this role for data at the same moment
-    contend for more than they gain, and the cost lands on the script thread
-    that the board counter is waiting for.
-
-    Re-measure before reintroducing threads here (`parallel` vs a plain loop,
-    steady state, warm pool) -- the answer is server-side and could change.
+    On a single connection they take turns instead. Threads would only queue on
+    the same connection anyway, and doing it here keeps the waiting out of the
+    pool, where it costs a thread apiece for nothing.
     """
-    return [c() for c in calls]
+    if not calls:
+        return []
+    if MAX_CONNECTIONS < 2 or len(calls) == 1:
+        return [c() for c in calls]
+    with ThreadPoolExecutor(max_workers=min(len(calls), MAX_CONNECTIONS)) as ex:
+        return [f.result() for f in [ex.submit(c) for c in calls]]
 
 
 def latest_data_time():

@@ -62,20 +62,9 @@ Direction is done circularly — the deviation from the average is taken with
 `signed_diff` first, so a range spanning 0°/360° behaves. If nothing was
 sustained on a side, that side reads zero rather than an inverted range.
 
-The window runs on its own 30 s cadence (`RANGE_REFRESH_S`) rather than on
-every poll; the deviations are re-derived against the current average in
-between, so the + and - follow the big numbers at the full refresh rate.
-
-It is also **extended rather than re-read**, by `live_feed.splice` — the same
-treatment the leading edge and the board trace get. Re-querying the whole window
-cost ~1.6 s and 3,300 rows every 30 s; fetching only the tail since the last
-sample costs ~0.3 s and ~30 rows for a frame that is identical row for row (the
-overlapping bucket is taken from the newer read, which is the complete one). A
-gap longer than `RANGE_REFILL_GAP`, or a clock that moves backwards, refetches
-the whole window rather than splicing across a hole.
-
-The window itself is held by the worker and is the same for every viewer; the
-deviations against *your* average are derived per session, on every tick.
+The 30-minute query costs ~14 s against ~9 s for the leading edge, so it runs
+on its own 30 s cadence (`RANGE_REFRESH_S`) rather than on every poll; the
+deviations are re-derived against the current average in between.
 
 ## Boat metrics (NZL)
 
@@ -253,71 +242,15 @@ shows the timestamp of the newest data instead.
 
 ## Modes
 
-**Live** — queries TimescaleDB every 2 s with no caching or buffering, so the
+**Live** — queries TimescaleDB every 3 s with no caching or buffering, so the
 leading edge is always current. Each poll re-reads the whole trailing window,
 which is stateless and cannot drift or gap.
-
-### Refresh timing
-
-Streamlit runs **one script thread per session** and takes fragment reruns one
-at a time, so the two timers are not independent: while one fragment is
-querying, the other waits. That is why the wind side does not query on the
-script thread at all — `live_feed.LiveFeed` owns those queries on a worker, and
-`draw` renders whatever the worker last put down, in ~0.03 s.
-
-**This database punishes concurrency**, which shapes everything here. Two
-measurements of the same effect:
-
-- the poll's three queries cost ~1.98 s issued together against ~1.21 s issued
-  one after another (~0.40 s each), so `wind_data.parallel` runs them in order;
-- with the worker polling, the board's own tick goes from ~0.33 s to ~1.12 s.
-
-So every query is kept to the fewest round trips, because a round trip costs
-~0.3 s whatever it asks for — window size barely matters:
-
-| Work | Cost | Cadence | Where |
-|---|---|---|---|
-| Leading-edge wind, tail only | ~0.33 s | 2 s | worker |
-| Leading-edge wind, full 21 min *(after a gap)* | ~0.74 s | rare | worker |
-| Boat window (60 s, read whole) | ~0.36 s | 2 s | worker |
-| Mark positions | ~0.35 s | 10 s | worker |
-| 30 min range, tail only | ~0.30 s | 30 s | worker |
-| 30 min range, full window *(after a gap)* | ~1.6 s | rare | worker |
-| Board tick (incremental height) | ~0.33 s | 500 ms | script thread |
-| Wind render from the snapshot | ~0.03 s | 2 s | script thread |
-
-Measured board tick gap, against its nominal 500 ms:
-
-| | median | worst |
-|---|---|---|
-| Queries fanned out, 30 min window re-read each time | 2.80 s | 7.2 s |
-| Queries in order, range extended by a tail | 1.69 s | 3.7 s |
-| Wind moved to the worker | **1.07 s** | 1.84 s |
-
-What is left is the worker and the board tick contending at the database. The
-only way past it is for one thread to own every query — see
-[Known limits](#known-limits).
 
 **Replay** — pick any date/time (UTC) and press play; it runs forward at normal
 speed through the identical calculation path. Replay prefetches in 10-minute
 blocks and slices locally, so playback stays smooth without hammering the API.
 Each block carries a 31-minute warm-up behind it so the range has its full
 window from the first frame, which makes the first load of a block slower.
-
-### Known limits
-
-**The board counter still contends with the worker.** The counter's fragment
-does its own 500 ms query on the script thread while the worker is querying on
-another, and this server serves two callers more slowly than one: the tick costs
-~0.33 s alone and ~1.12 s alongside the worker, which is most of the gap between
-the measured 1.07 s and the 500 ms the timer asks for.
-
-The way past it is for the **worker to own every query, board included** — it
-would poll the board tail on a 500 ms sub-cadence and interleave the wind work,
-so nothing ever queries concurrently and both fragments become pure render. That
-would put the counter on its 500 ms tick with data ~0.3 s old. It is not done
-here because it moves the board buffer out of the fragment that owns it today,
-and the board path is deliberately being left alone.
 
 ## Running it as a floating widget
 
