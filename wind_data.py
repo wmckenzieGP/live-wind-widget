@@ -61,14 +61,16 @@ CAMBER_ZERO = ["BTN_WT_P_CAMBER_ZERO", "BTN_WT_S_CAMBER_ZERO"]
 # boat is actually sailing.
 SOG = "GPS_SOG_km_h_1"
 YAW_RATE = "RATE_YAW_deg_s_1"
-# Clew offset across the boat. Not visible on B15 until our training block
-# starts, so its tile reads dashes before then.
+# Clew offset across the boat. The fleet reports millimetres. B15 has no such
+# channel and reports the same thing in metres: live on 2026-11-05 it read -0.72
+# to +0.32 m and tracked clew angle at 0.96, as the fleet's millimetres do.
 CLEW = "LENGTH_WING_CLEW_mm"
+CLEW_M = "LENGTH_WING_CLEW_m"
 # Not displayed -- it says which tack the clew is being read on.
 TWA = "TWA_SGP_deg"
 
 BOAT_ANALOG = [RUD_AVG, RUD_DIFF, PITCH, CAMBER, CAMBER_TARGET, SOG, YAW_RATE,
-               CLEW, TWA]
+               CLEW, CLEW_M, TWA]
 
 # Daggerboard vertical height, from the linear position sensor. The rule counts
 # the board going up and down, so height is the quantity it is actually about:

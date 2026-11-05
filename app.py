@@ -492,6 +492,8 @@ def compute_boat(b: pd.DataFrame) -> dict:
         r["pitch"] = float(window.mean())
 
     clew = _last(wd.CLEW)
+    if clew.empty:
+        clew = _last(wd.CLEW_M) * 1000.0
     twa = _last(wd.TWA)
     if not clew.empty and not twa.empty:
         # The channel is fixed to the boat, so it mirrors between tacks. Keeping
