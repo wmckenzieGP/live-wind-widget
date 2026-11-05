@@ -43,7 +43,11 @@ LON = "LONGITUDE_MDSS_deg"
 GPS_SCALE = 10_000_000
 
 # Boat channels live at level "strm", not "mdss".
-BOAT = "NZL"
+#
+# The boats the selector offers. B15 is a shared hull: the login only sees it
+# for the periods SailGP assigns it to us, and outside them it returns zero rows
+# with no error. So an empty B15 means "not ours then", not "did not sail".
+BOATS = ["NZL", "B15"]
 RUD_AVG = "ANGLE_RUD_AVG_deg"
 RUD_DIFF = "ANGLE_RUD_DIFF_deg"
 PITCH = "PITCH_deg"
@@ -57,8 +61,14 @@ CAMBER_ZERO = ["BTN_WT_P_CAMBER_ZERO", "BTN_WT_S_CAMBER_ZERO"]
 # boat is actually sailing.
 SOG = "GPS_SOG_km_h_1"
 YAW_RATE = "RATE_YAW_deg_s_1"
+# Clew offset across the boat. Not visible on B15 until our training block
+# starts, so its tile reads dashes before then.
+CLEW = "LENGTH_WING_CLEW_mm"
+# Not displayed -- it says which tack the clew is being read on.
+TWA = "TWA_SGP_deg"
 
-BOAT_ANALOG = [RUD_AVG, RUD_DIFF, PITCH, CAMBER, CAMBER_TARGET, SOG, YAW_RATE]
+BOAT_ANALOG = [RUD_AVG, RUD_DIFF, PITCH, CAMBER, CAMBER_TARGET, SOG, YAW_RATE,
+               CLEW, TWA]
 
 # Daggerboard vertical height, from the linear position sensor. The rule counts
 # the board going up and down, so height is the quantity it is actually about:
@@ -183,7 +193,7 @@ def fetch_wind(start, end, marks: list[str] | None = None) -> tuple[pd.DataFrame
 # Boat
 # ---------------------------------------------------------------------------
 
-def fetch_boat(start, end, boat: str = BOAT) -> pd.DataFrame:
+def fetch_boat(start, end, boat: str) -> pd.DataFrame:
     """Return a 1 s frame of boat channels, one column per measurement.
 
     Analogue channels decimate with `last`; the camber-zero buttons use `max`
@@ -224,7 +234,7 @@ _BOARD_SELECT = ",\n".join(
 )
 
 
-def _board_frame(where: str, params: dict) -> pd.DataFrame:
+def _board_frame(where: str, params: dict, boat: str) -> pd.DataFrame:
     sql = f"""
 SELECT
     time_bucket('{BOARD_EVERY}', time) AS "_time",
@@ -237,29 +247,31 @@ WHERE boat = %(boat)s
 GROUP BY 1
 ORDER BY 1;
 """
-    df = _client().query(sql, {"boat": BOAT, "channels": BOARD_CHANNELS, **params})
+    df = _client().query(sql, {"boat": boat, "channels": BOARD_CHANNELS, **params})
     return _indexed(df)
 
 
-def fetch_board_recent(window: pd.Timedelta) -> pd.DataFrame:
+def fetch_board_recent(window: pd.Timedelta, boat: str) -> pd.DataFrame:
     """Backfill: the trailing `window`, relative to server time so no client
     clock skew creeps in."""
     return _board_frame(
         "time >= now() - %(lookback)s::interval",
         {"lookback": f"{int(window.total_seconds())} seconds"},
+        boat,
     )
 
 
-def fetch_board_since(after: pd.Timestamp) -> pd.DataFrame:
+def fetch_board_since(after: pd.Timestamp, boat: str) -> pd.DataFrame:
     """The steady-state call -- only what has arrived since the last sample."""
-    return _board_frame("time >= %(after)s", {"after": _fmt_ns(after)})
+    return _board_frame("time >= %(after)s", {"after": _fmt_ns(after)}, boat)
 
 
-def fetch_board_range(start, end) -> pd.DataFrame:
+def fetch_board_range(start, end, boat: str) -> pd.DataFrame:
     """Explicit window, for replay."""
     return _board_frame(
         "time >= %(start)s AND time < %(stop)s",
         {"start": _fmt(start), "stop": _fmt(end)},
+        boat,
     )
 
 

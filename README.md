@@ -1,7 +1,7 @@
 # Live Wind Widget
 
-Course wind, NZL boat trim, and daggerboard cycling at a glance for SailGP
-racing. A compact panel, designed to be shrunk into the corner of a screen and
+Course wind, boat trim, and daggerboard cycling at a glance for SailGP racing,
+for NZL or the shared hull B15. A compact panel, designed to be shrunk into the corner of a screen and
 left running. No login.
 
 ```bash
@@ -66,7 +66,24 @@ The 30-minute query costs ~14 s against ~9 s for the leading edge, so it runs
 on its own 30 s cadence (`RANGE_REFRESH_S`) rather than on every poll; the
 deviations are re-derived against the current average in between.
 
-## Boat metrics (NZL)
+## Choosing the boat
+
+The **NZL / B15** selector beside Live / Replay picks the boat behind the boat
+tiles, board cycling and height traces, in both modes. The wind tiles come from
+the course marks, so they do not change with it.
+
+A new session opens on B15 through 2026-11-14 (`CAMP_LAST_DAY` in `app.py`) and
+on NZL after that. To offer another boat, add it to `BOATS` in `wind_data.py`.
+
+**B15 is a shared hull.** The login only sees it for the periods SailGP assigns
+it to us. Outside them it returns zero rows with no error, so `no B15 data` in
+the status line means "not ours right now", not "did not sail".
+
+**B15's stream has arrived in bursts**: about 1.4 s of samples, then a hole of
+about 3 s (up to 7 s). The height traces break at each hole and `boards X.Xs`
+can go amber. Both are the feed's real state, so neither is smoothed over.
+
+## Boat metrics
 
 Stacked under the wind tiles. The widget never grows wider.
 
@@ -75,6 +92,7 @@ Stacked under the wind tiles. The widget never grows wider.
 | **Rud AVG** | `ANGLE_RUD_AVG_deg` | Rudder average, live |
 | **Rud DIFF** | `ANGLE_RUD_DIFF_deg` | Rudder differential, **unsigned** — how far off zero, not which side |
 | **Pitch · 5s** | `PITCH_deg` | Mean of the last 5 seconds |
+| **Clew** | `LENGTH_WING_CLEW_mm` | Clew offset across the boat, mm. Starboard as read, port inverted, so **positive = to leeward**, matching `wing_clew_length_n` in the dashboard |
 | **Camber** | `ANGLE_CA1_deg` | Live camber, signed |
 | **Camber %** | `ANGLE_CA1_deg` / `CAMBER_INPUT_deg` | Percentage of the set camber reached, 0–100 |
 
@@ -292,6 +310,8 @@ name in the `boat` column.
 | `LATITUDE_MDSS_deg` / `LONGITUDE_MDSS_deg` | mdss | Integers — divide by 10,000,000 |
 | `ANGLE_RUD_AVG_deg` / `ANGLE_RUD_DIFF_deg` | strm | Rudder, 1 Hz |
 | `PITCH_deg` | strm | 5 Hz |
+| `LENGTH_WING_CLEW_mm` | strm | Clew offset, mm, 2 Hz |
+| `TWA_SGP_deg` | strm | Not displayed — sets the clew's tack |
 | `ANGLE_CA1_deg` / `CAMBER_INPUT_deg` | strm | Camber and its demand |
 | `BTN_WT_P_CAMBER_ZERO` / `BTN_WT_S_CAMBER_ZERO` | strm | Camber-zero buttons |
 | `GPS_SOG_km_h_1` / `RATE_YAW_deg_s_1` | strm | Not displayed — they gate the alarms |

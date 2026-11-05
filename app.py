@@ -30,6 +30,9 @@ REPLAY_TICK_S = 1
 REPLAY_BLOCK = pd.Timedelta("10min")
 # Most recent session with marks deployed (see README).
 DEFAULT_REPLAY = dt.datetime(2026, 6, 21, 17, 0, 0)
+# A new session opens on B15 through the Pensacola camp and on NZL after it, so
+# nobody has to remember to change this back. The selector overrides it.
+CAMP_LAST_DAY = dt.date(2026, 11, 14)
 
 # Wind range: how far back to look, and how long a shift must hold to count.
 RANGE_WINDOW = pd.Timedelta("30min")
@@ -221,7 +224,7 @@ def _range_lookback() -> pd.Timedelta:
     return RANGE_WINDOW + RANGE_DWELL + pd.Timedelta("1min")
 
 
-def fetch_live(now: pd.Timestamp, sma: pd.Timedelta):
+def fetch_live(now: pd.Timestamp, sma: pd.Timedelta, boat: str):
     """Direct query, no cache and no buffering -- minimum possible delay."""
     return wd.parallel(
         # Only the five course marks carry wind we use; SL1/SL2 would be a
@@ -234,7 +237,7 @@ def fetch_live(now: pd.Timestamp, sma: pd.Timedelta):
         # until the next refetch. One mark's worth of rows is the cheaper side
         # of that trade.
         lambda: wd.fetch_wind(now - _lookback(sma), now, wd.COURSE_WIND_MARKS),
-        lambda: wd.fetch_boat(now - BOAT_WINDOW, now),
+        lambda: wd.fetch_boat(now - BOAT_WINDOW, now, boat),
         lambda: wd.fetch_positions(now - pd.Timedelta("10min"), now),
     )
 
@@ -245,32 +248,32 @@ def fetch_live_range(now: pd.Timestamp):
 
 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=32)
-def _replay_block(block_start: pd.Timestamp, sma_s: int):
+def _replay_block(block_start: pd.Timestamp, sma_s: int, boat: str):
     """One block of replay data plus the warm-up behind it. Cached so playback
     slices locally instead of re-querying every tick."""
     warm = max(_lookback(pd.Timedelta(seconds=sma_s)), _range_lookback())
     start, end = block_start - warm, block_start + REPLAY_BLOCK
     (twd, tws), boat, pos = wd.parallel(
         lambda: wd.fetch_wind(start, end, wd.COURSE_WIND_MARKS),
-        lambda: wd.fetch_boat(start, end),
+        lambda: wd.fetch_boat(start, end, boat),
         lambda: wd.fetch_positions(start, end),
     )
     return twd, tws, boat, pos
 
 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=32)
-def _replay_board(block_start: pd.Timestamp) -> pd.DataFrame:
+def _replay_board(block_start: pd.Timestamp, boat: str) -> pd.DataFrame:
     """Board trace for one replay block, with enough warm-up behind it for the
     detector to have established a direction before the block starts."""
     return wd.fetch_board_range(block_start - BOARD_BUFFER,
-                               block_start + REPLAY_BLOCK)
+                               block_start + REPLAY_BLOCK, boat)
 
 
-def fetch_replay(virtual_now: pd.Timestamp, sma: pd.Timedelta):
+def fetch_replay(virtual_now: pd.Timestamp, sma: pd.Timedelta, boat: str):
     block_start = virtual_now.floor(REPLAY_BLOCK)
-    twd, tws, boat, pos = _replay_block(block_start, int(sma.total_seconds()))
+    twd, tws, frame, pos = _replay_block(block_start, int(sma.total_seconds()), boat)
     return (_upto(twd, virtual_now), _upto(tws, virtual_now),
-            _upto(boat, virtual_now), pos)
+            _upto(frame, virtual_now), pos)
 
 
 def _upto(df: pd.DataFrame, when: pd.Timestamp) -> pd.DataFrame:
@@ -446,12 +449,12 @@ def wind_range(twd: pd.DataFrame, tws: pd.DataFrame,
 
 
 def compute_boat(b: pd.DataFrame) -> dict:
-    """Rudder, pitch and camber for the boat section.
+    """Rudder, pitch, clew and camber for the boat section.
 
     The differential is reported unsigned -- which side it favours is not the
     point, how far off zero it sits is.
     """
-    r = {k: float("nan") for k in ("rud_avg", "rud_diff", "pitch",
+    r = {k: float("nan") for k in ("rud_avg", "rud_diff", "pitch", "clew",
                                    "camber", "camber_pct")}
     r["rud_alarm"] = False
     r["camber_alarm"] = False
@@ -487,6 +490,15 @@ def compute_boat(b: pd.DataFrame) -> dict:
     if not pitch.empty:
         window = pitch[pitch.index >= pitch.index[-1] - PITCH_AVG]
         r["pitch"] = float(window.mean())
+
+    clew = _last(wd.CLEW)
+    twa = _last(wd.TWA)
+    if not clew.empty and not twa.empty:
+        # The channel is fixed to the boat, so it mirrors between tacks. Keeping
+        # starboard as it is and inverting port gives positive = clew to leeward,
+        # the same reading as wing_clew_length_n in the dashboard. Without a TWA
+        # the side is unknown, so the tile stays dashed rather than guess.
+        r["clew"] = float(clew.iloc[-1]) * (1.0 if twa.iloc[-1] >= 0 else -1.0)
 
     camber = _last(wd.CAMBER)
     if not camber.empty:
@@ -561,7 +573,7 @@ def _zeroed(b: pd.DataFrame, now: pd.Timestamp) -> bool:
 # Board cycling
 # ---------------------------------------------------------------------------
 
-def board_buffer(now: pd.Timestamp) -> pd.DataFrame:
+def board_buffer(now: pd.Timestamp, boat: str) -> pd.DataFrame:
     """Keep a rolling cant trace in session state, extended a second at a time.
 
     Re-reading the whole window every tick would cost a second of latency for
@@ -570,15 +582,15 @@ def board_buffer(now: pd.Timestamp) -> pd.DataFrame:
     """
     buf = ss.get("board_buf")
     if buf is None or buf.empty:
-        buf = wd.fetch_board_recent(BOARD_BUFFER)
+        buf = wd.fetch_board_recent(BOARD_BUFFER, boat)
     else:
         gap = now - buf.index[-1]
         if gap > BOARD_REFILL_GAP or gap < pd.Timedelta(0):
             # Lost the thread (feed dropped, or the clock moved): start clean
             # rather than splice across a hole.
-            buf = wd.fetch_board_recent(BOARD_BUFFER)
+            buf = wd.fetch_board_recent(BOARD_BUFFER, boat)
         else:
-            new = wd.fetch_board_since(buf.index[-1])
+            new = wd.fetch_board_since(buf.index[-1], boat)
             if not new.empty:
                 buf = pd.concat([buf, new])
                 buf = buf[~buf.index.duplicated(keep="last")].sort_index()
@@ -650,6 +662,10 @@ def _signed(v, dp: int = 0, unit: str = "&deg;") -> str:
     return f"{'+' if v >= 0 else '&minus;'}{abs(v):.{dp}f}{unit}"
 
 
+def _clew(v) -> str:
+    return _signed(v, 0, "<span class='unit'>mm</span>")
+
+
 def _range(hi, lo, dp: int = 0, unit: str = "&deg;") -> str:
     return (f"<div class='rng'><span>{_signed(hi, dp, unit)}</span>"
             f"<span>{_signed(lo, dp, unit)}</span></div>")
@@ -679,7 +695,7 @@ def _tile(label: str, value: str, bg: str = "#ffffff", wide=False, small=False,
             f"{extra}</div>{sub}</div>")
 
 
-def render(r: dict, rng: dict, b: dict, sma_min: int) -> str:
+def render(r: dict, rng: dict, b: dict, sma_min: int, boat: str) -> str:
     if r["deployed"]:
         axis = _tile("Course Axis", _deg(r["axis"]), wide=True)
     else:
@@ -706,11 +722,12 @@ def render(r: dict, rng: dict, b: dict, sma_min: int) -> str:
                 extra=_range(rng.get("tws_hi"), rng.get("tws_lo"), 1, ""))
         + gate("top", "Top")
         + gate("bottom", "Bottom")
-        + f"<div class='sect'>{wd.BOAT}</div>"
+        + f"<div class='sect'>{boat}</div>"
         # ---- boat tiles ----
         + _tile("Rud AVG", _num(b.get("rud_avg")))
         + _tile("Rud DIFF", _num(b.get("rud_diff"), 2), alarm=b.get("rud_alarm"))
-        + _tile("Pitch &middot; 5s", _num(b.get("pitch")), wide=True)
+        + _tile("Pitch &middot; 5s", _num(b.get("pitch")))
+        + _tile("Clew &middot; + Leeward", _clew(b.get("clew")))
         + _tile("Camber", _num(b.get("camber")))
         + _tile("Camber %", _num(b.get("camber_pct"), 0, "%"),
                 alarm=b.get("camber_alarm"))
@@ -901,11 +918,11 @@ def status_bits(r: dict, tag: str, vnow: pd.Timestamp | None,
         # against other apps.
         bits.append(f"<span class='clock'>{vnow:%H:%M:%S}Z</span>")
         if r["latest"] is None:
-            bits.append("<span class='warn'>no data</span>")
+            bits.append("<span class='warn'>no mark data</span>")
     elif r["latest"] is not None:
         bits.append(f"{r['latest']:%H:%M:%S}Z")
     elif vnow is not None:
-        bits.append(f"{vnow:%H:%M:%S}Z &mdash; <span class='warn'>no data</span>")
+        bits.append(f"{vnow:%H:%M:%S}Z &mdash; <span class='warn'>no mark data</span>")
     if not pd.isna(r["separation"]):
         bits.append(f"gate {r['separation']:.0f} m")
     if r["missing"]:
@@ -927,6 +944,8 @@ def status_line(bits: list[str]) -> str:
 
 ss = st.session_state
 ss.setdefault("mode", "Live")
+ss.setdefault("boat", "B15" if dt.datetime.now(dt.timezone.utc).date() <= CAMP_LAST_DAY
+              else "NZL")
 ss.setdefault("playing", False)
 ss.setdefault("elapsed", 0.0)     # seconds of playback consumed
 ss.setdefault("wall", None)       # wall-clock time when play was pressed
@@ -942,11 +961,20 @@ ss.setdefault("trace_html", None)   # last good height trace, held with the tile
 ss.setdefault("feed_at", None)    # when the feed last failed, for the back-off
 ss.setdefault("feed_msg", None)   # and what it said, shown under the status line
 
-mode = st.segmented_control("Mode", ["Live", "Replay"], default=ss["mode"],
-                            key="mode_ctl", label_visibility="collapsed")
+with st.container(horizontal=True, horizontal_alignment="distribute"):
+    mode = st.segmented_control("Mode", ["Live", "Replay"], default=ss["mode"],
+                                key="mode_ctl", label_visibility="collapsed")
+    boat_pick = st.segmented_control("Boat", wd.BOATS, default=ss["boat"],
+                                     key="boat_ctl", label_visibility="collapsed")
 if mode and mode != ss["mode"]:
     ss.update(mode=mode, playing=False, elapsed=0.0, wall=None)
 mode = ss["mode"]
+if boat_pick and boat_pick != ss["boat"]:
+    # Everything held is the old boat's. Left in place, the height trace would
+    # splice two boats together and a dropped feed would put the old boat's
+    # frame back up under the new name.
+    ss.update(boat=boat_pick, board_buf=None, wind_html=None, board_html=None,
+              board_bit=None, trace_html=None)
 
 replay_start = None
 if mode == "Replay":
@@ -1038,10 +1066,17 @@ def feed_diag() -> None:
         st.code(ss["feed_msg"], language=None)
 
 
+def boat_bits(b: pd.DataFrame) -> list[str]:
+    """Name the boat that came back empty. On a shared hull zero rows is the
+    normal answer outside our assigned periods, not a fault, so it should not be
+    left to a row of dashes to explain."""
+    return [f"<span class='warn'>no {ss['boat']} data</span>"] if b.empty else []
+
+
 def blank_wind() -> str:
     """An all-dashes frame, for a feed that has never once answered."""
     return render(compute(pd.DataFrame(), pd.DataFrame(), {}, sma, wind_marks),
-                  {}, compute_boat(pd.DataFrame()), sma_min)
+                  {}, compute_boat(pd.DataFrame()), sma_min, ss["boat"])
 
 
 def draw():
@@ -1050,13 +1085,13 @@ def draw():
         try:
             if mode == "Live":
                 now = pd.Timestamp.utcnow().tz_localize(None)
-                (twd, tws), boat, pos = fetch_live(now, sma)
+                (twd, tws), boat, pos = fetch_live(now, sma, ss["boat"])
                 r = compute(twd, tws, pos, sma, wind_marks)
                 rng = live_range(now, r, wind_marks)
                 vnow, tag, replay = now, "live", False
             else:
                 vnow = virtual_now()
-                twd, tws, boat, pos = fetch_replay(vnow, sma)
+                twd, tws, boat, pos = fetch_replay(vnow, sma, ss["boat"])
                 r = compute(twd, tws, pos, sma, wind_marks)
                 # Replay already holds the whole window in the cached block, so
                 # there is nothing to throttle.
@@ -1067,8 +1102,8 @@ def draw():
 
             # The status line is drawn by the board fragment so it sits at the
             # bottom and, in replay, ticks once a second with the clock.
-            ss["wind_bits"] = status_bits(r, tag, vnow, replay)
-            ss["wind_html"] = render(r, rng, compute_boat(boat), sma_min)
+            ss["wind_bits"] = status_bits(r, tag, vnow, replay) + boat_bits(boat)
+            ss["wind_html"] = render(r, rng, compute_boat(boat), sma_min, ss["boat"])
             ss["feed_at"] = ss["feed_msg"] = None
         except wd.FEED_ERRORS as e:
             feed_failed(e)
@@ -1090,10 +1125,10 @@ def draw_boards():
         try:
             if mode == "Live":
                 now = pd.Timestamp.utcnow().tz_localize(None)
-                buf = board_buffer(now)
+                buf = board_buffer(now, ss["boat"])
             else:
                 now = virtual_now()
-                buf = _upto(_replay_board(now.floor(REPLAY_BLOCK)), now)
+                buf = _upto(_replay_board(now.floor(REPLAY_BLOCK), ss["boat"]), now)
 
             counts = board_counts(buf, now)
             ss["board_html"] = render_boards(counts)
