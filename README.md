@@ -97,6 +97,7 @@ Stacked under the wind tiles. The widget never grows wider.
 | **Clew** | `LENGTH_WING_CLEW_mm`, or `LENGTH_WING_CLEW_m` on B15 | Clew offset across the boat, mm. Starboard as read, port inverted, so **positive = to leeward**, matching `wing_clew_length_n` in the dashboard |
 | **Camber** | `ANGLE_CA1_deg` | Live camber, signed |
 | **Camber %** | `ANGLE_CA1_deg` / `CAMBER_INPUT_deg` | Percentage of the set camber reached, 0–100 |
+| **Stuck Button** | `STUCK_BUTTON_GLOBAL_unk`, then the panel flags | `NONE`, or the stuck button's name, flashing. See [Stuck button](#stuck-button) |
 
 `ANGLE_CA1_deg` is the root camber actuator, the one that tracks the crew's
 demand one-for-one and flips sign across an invert. CA4–CA6 fall away down the
@@ -109,9 +110,8 @@ Two tiles flash red. Both need their condition to hold for 3 seconds, and both
 are gated on the boat actually sailing.
 
 **Rud DIFF** — flashes when the differential sits within ±0.1° of zero. It
-rests on zero through manoeuvres and whenever the boat is not pressed up, so it
-only alarms once the boat has been **above 30 km/h in a straight line for 5
-seconds** (`RATE_YAW_deg_s_1` smoothed over 3 s, under 3°/s).
+rests on zero whenever the boat is not pressed up, so it only alarms **above 30
+km/h**. Speed is the only gate.
 
 **Camber %** — flashes when the reading *settles* below 100%, which is an
 invert that was not held long enough. Sweeping through on the way to target is
@@ -132,6 +132,36 @@ differential rests on zero, so ungated both flash almost continuously whenever
 the boat is not racing. Thresholds are named constants at the top of `app.py`.
 
 Tiles read `—` whenever their channel has no data, exactly like the wind tiles.
+
+### Stuck button
+
+The third alarm comes from the boat, not from this widget. The boat flags a button
+held for about 20 s, so that is the earliest the box can react, and the tile adds
+up to one 3 s poll on top. It is not gated on speed, because a button stuck at the
+dock is just as stuck. The flag stays up until it clears on the boat: on
+2026-11-05 it cleared as `CMD_P_RESET_STUCK_unk` ran.
+
+Each panel has a 1 Hz flag whose value is a **bitfield of the stuck buttons**, so
+`CADI_P_STUCK_unk = 4` means bit 4 of the port foot unit, which is the wing
+trimmer's board up. `stuck_buttons.py` holds the bit names and how they were found.
+A bit with no name still flashes, showing its panel and bit number.
+
+| Panel | Flag | Named bits |
+|---|---|---|
+| Foot buttons | `CADI_P/S_STUCK_unk` | Proved on a real fault, 2026-11-05 |
+| Wheel | `WHEEL_P/S_STUCK_unk` | Proved on a real fault, 2026-09-20. Board up and down only, from what the boards did |
+| Flight controller, grinder, wing trimmer | `G3K_FC/GD/WT_P/S_STUCK_unk` | Bits matched to `BTN_*` channels. These panels have not faulted in the data checked |
+| Pilot | `PILOT_P/S_STUCK_unk` | As above |
+| Strategist | `G3K_T_P/S_STUCK_unk` | None. No `BTN_*` channels exist, so it shows panel and bit |
+
+Checked in replay against both faults: **B15 2026-11-05 21:39:38–21:40:22Z** (port
+board up, wing trimmer foot button) and **NZL 2026-09-20 from 14:00:30Z** (stbd
+board down, wheel, on and off for 18 minutes during racing).
+
+Only the global flag is on every poll. The fourteen panel flags join that same
+boat query when a button needs naming: once when the flag goes up, then every 30 s
+in case a second button follows. Between those polls the tile holds the name, so
+for the first 3 s of a fault it reads `BUTTON STUCK`.
 
 ## Board cycling
 
@@ -188,12 +218,13 @@ threshold never goes below 3 available, so it does not cry wolf when foiling.
 This is the one metric where lag costs something, so it is built differently
 from the rest of the widget:
 
-- **Its own 500 ms fragment.** It redraws on a separate timer and never waits on
-  the wind queries. Waiting for the next redraw is dead time between data landing
-  and a sailor seeing it, so the tick is half the wind's — but it cannot go much
-  below this. The fetch itself measures ~0.28 s, and a tick shorter than its own
-  query only queues requests faster than they come back; at 500 ms the query
-  occupies a bit over half the tick, which is the practical floor for polling.
+- **Its own 500 ms fragment.** It redraws on a separate timer. Waiting for the next
+  redraw is dead time between data landing and a sailor seeing it, so the tick is
+  shorter than the wind's — but it cannot go much below this. The fetch itself
+  measures ~0.28 s, and a tick shorter than its own query only queues requests
+  faster than they come back; at 500 ms the query occupies a bit over half the
+  tick, which is the practical floor for polling. It has its own timer but **not
+  its own thread**, see below.
 - **A pool of warm TimescaleDB connections.** Opening a connection per query
   costs a TLS handshake — measured at 3.3 s against 1.0 s on a reused one. The
   pool (`TSDB_MAX_CONNECTIONS`, 3 by default) is shared by every query in the app. It is a
@@ -210,6 +241,34 @@ movement made 61 s ago has aged out whether or not the feed is keeping up. Feed
 lag shows in the status line instead, as `boards 0.4s`, which turns amber past
 3 s — a stale counter is worse than no counter, so it has to be visible. That
 figure assumes the machine clock is synced.
+
+### New features must not slow it
+
+**Board cycling is always the priority, for speed and lowest delay. No feature may
+slow it.** Two measured facts decide how a feature can be added:
+
+- **Streamlit runs both fragments one at a time, on one thread per session.** A
+  board tick due during a wind poll waits for that poll to finish, so anything that
+  makes the wind poll longer delays the board counter. Measured in September, board
+  ticks ran 2.80 s apart at the median, not 500 ms.
+- **A background thread is not a way out.** The server serves concurrent queries
+  worse than sequential ones: the board's own tick went from ~0.33 s to ~1.12 s
+  while a second thread queried. That line of work took board delays to 5 s and
+  more, and was reverted on 2026-09-06 (`631b979`).
+
+So for any new feature:
+
+1. Do not touch the board query, its channels, its timer or its fragment.
+2. Add no new query, thread, timer or connection. A new channel joins `fetch_boat`.
+3. Keep that query the same size. Drop a channel nothing reads to pay for it, or
+   fetch it only when it is needed, as the stuck-button panel flags are.
+4. Measure it: alternate before and after on the real query for at least 60 rounds.
+   One run proves nothing here, because query times are noisy.
+
+The stuck button followed these rules, and dropping the unused `RATE_YAW_deg_s_1`
+paid for its flag. Over 60 rounds the boat query was 384 ms before and 380 ms after
+on one run, and 400 ms and 394 ms on another. A poll that also carries the panel
+flags takes 20–40 ms longer, which is 2 polls in 24 through the 2026-11-05 fault.
 
 ### Height trace
 
@@ -317,7 +376,9 @@ name in the `boat` column.
 | `TWA_SGP_deg` | strm | Not displayed — sets the clew's tack |
 | `ANGLE_CA1_deg` / `CAMBER_INPUT_deg` | strm | Camber and its demand |
 | `BTN_WT_P_CAMBER_ZERO` / `BTN_WT_S_CAMBER_ZERO` | strm | Camber-zero buttons |
-| `GPS_SOG_km_h_1` / `RATE_YAW_deg_s_1` | strm | Not displayed — they gate the alarms |
+| `GPS_SOG_km_h_1` | strm | Not displayed — gates the alarms |
+| `STUCK_BUTTON_GLOBAL_unk` | strm | Any button stuck, 1 Hz. On every poll |
+| `CADI_`, `WHEEL_`, `PILOT_`, `G3K_FC_`, `G3K_GD_`, `G3K_T_`, `G3K_WT_` + `P/S_STUCK_unk` | strm | Bitfield of the panel's stuck buttons, 1 Hz. Fetched only to name one |
 | `LENGTH_DB_H_P_mm` / `LENGTH_DB_H_S_mm` | strm | Daggerboard height, mm, 10 Hz — the cycling counter |
 
 Marks: `WG1`/`WG2` (windward gate), `LG1`/`LG2` (leeward gate), `M1`,
@@ -375,6 +436,7 @@ only and contains live credentials.
 | `app.py` | UI, layout, metrics, alarm rules, mode control, refresh timing |
 | `wind_data.py` | TimescaleDB queries, pooled client, mark and boat channel constants |
 | `wind_math.py` | Circular statistics, dwell filtering, board movement detection, geometry, colour ramp |
+| `stuck_buttons.py` | Stuck-button flags, the names of their bits, and when to ask for them |
 | `tsdb_config.py` | Credentials and TLS material (shared migration kit) |
 | `tsdb_client.py` / `pivot_template.sql` | Query layer: pooled connections, pivots, latest-value lookups (shared migration kit) |
 

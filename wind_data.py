@@ -20,6 +20,7 @@ import psycopg2
 import psycopg2.pool
 
 import tsdb_config
+from stuck_buttons import STUCK_GLOBAL, STUCK_PANELS
 from tsdb_client import TSDBClient, TSDBTimeout
 
 # "The database is not answering right now", as opposed to "that query was
@@ -57,10 +58,9 @@ PITCH = "PITCH_deg"
 CAMBER = "ANGLE_CA1_deg"
 CAMBER_TARGET = "CAMBER_INPUT_deg"          # magnitude, always positive
 CAMBER_ZERO = ["BTN_WT_P_CAMBER_ZERO", "BTN_WT_S_CAMBER_ZERO"]
-# Not displayed -- these gate the alarms, which only mean anything while the
+# Not displayed -- this gates the alarms, which only mean anything while the
 # boat is actually sailing.
 SOG = "GPS_SOG_km_h_1"
-YAW_RATE = "RATE_YAW_deg_s_1"
 # Clew offset across the boat. The fleet reports millimetres. B15 has no such
 # channel and reports the same thing in metres: live on 2026-11-05 it read -0.72
 # to +0.32 m and tracked clew angle at 0.96, as the fleet's millimetres do.
@@ -69,8 +69,8 @@ CLEW_M = "LENGTH_WING_CLEW_m"
 # Not displayed -- it says which tack the clew is being read on.
 TWA = "TWA_SGP_deg"
 
-BOAT_ANALOG = [RUD_AVG, RUD_DIFF, PITCH, CAMBER, CAMBER_TARGET, SOG, YAW_RATE,
-               CLEW, CLEW_M, TWA]
+BOAT_ANALOG = [RUD_AVG, RUD_DIFF, PITCH, CAMBER, CAMBER_TARGET, SOG,
+               CLEW, CLEW_M, TWA, STUCK_GLOBAL]
 
 # Daggerboard vertical height, from the linear position sensor. The rule counts
 # the board going up and down, so height is the quantity it is actually about:
@@ -195,18 +195,25 @@ def fetch_wind(start, end, marks: list[str] | None = None) -> tuple[pd.DataFrame
 # Boat
 # ---------------------------------------------------------------------------
 
-def fetch_boat(start, end, boat: str) -> pd.DataFrame:
+def fetch_boat(start, end, boat: str, stuck_panels: bool = False) -> pd.DataFrame:
     """Return a 1 s frame of boat channels, one column per measurement.
 
     Analogue channels decimate with `last`; the camber-zero buttons use `max`
     so a press shorter than a second still shows up.
+
+    `stuck_panels` adds the flags that name a stuck button. They ride on this
+    query because a query of their own would hold the script thread the board
+    counter runs on, and live they are only asked for when a button needs
+    naming (`stuck_buttons.Namer`): all fourteen add 20-40 ms to the poll that
+    carries them, which is not worth paying when nothing is stuck.
     """
-    aggs = {c: "last" for c in BOAT_ANALOG}
+    channels = BOAT_ANALOG + (list(STUCK_PANELS) if stuck_panels else [])
+    aggs = {c: "last" for c in channels}
     aggs.update({c: "max" for c in CAMBER_ZERO})
 
     df = _client().fetch_pivot(
         boat=boat,
-        channels=BOAT_ANALOG + CAMBER_ZERO,
+        channels=channels + CAMBER_ZERO,
         start=_fmt(start),
         stop=_fmt(end),
         bucket="1 second",

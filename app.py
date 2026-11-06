@@ -17,6 +17,7 @@ from typing import NamedTuple
 import pandas as pd
 import streamlit as st
 
+import stuck_buttons
 import wind_data as wd
 from wind_math import (bearing, board_movements, bridge, circular_ema,
                        circular_mean_columns, circular_sma, distance_m,
@@ -177,6 +178,8 @@ st.markdown("""
     0%, 100% {background: #ffd9d9; border-color: #e88a8a;}
     50%      {background: #ff8f8f; border-color: #d05a5a;}
   }
+  /* The grey footnote all but disappears at the deep end of the pulse. */
+  .tile.alarm .sub {color: #000000;}
   .status {font-size: 10px; color: #7b8189; text-align: center;
            padding: 5px 0 0; line-height: 1.5;}
   .clock {font-size: 12px; font-weight: 700; color: #3d4349;
@@ -224,7 +227,7 @@ def _range_lookback() -> pd.Timedelta:
     return RANGE_WINDOW + RANGE_DWELL + pd.Timedelta("1min")
 
 
-def fetch_live(now: pd.Timestamp, sma: pd.Timedelta, boat: str):
+def fetch_live(now: pd.Timestamp, sma: pd.Timedelta, boat: str, stuck_panels: bool):
     """Direct query, no cache and no buffering -- minimum possible delay."""
     return wd.parallel(
         # Only the five course marks carry wind we use; SL1/SL2 would be a
@@ -237,7 +240,7 @@ def fetch_live(now: pd.Timestamp, sma: pd.Timedelta, boat: str):
         # until the next refetch. One mark's worth of rows is the cheaper side
         # of that trade.
         lambda: wd.fetch_wind(now - _lookback(sma), now, wd.COURSE_WIND_MARKS),
-        lambda: wd.fetch_boat(now - BOAT_WINDOW, now, boat),
+        lambda: wd.fetch_boat(now - BOAT_WINDOW, now, boat, stuck_panels),
         lambda: wd.fetch_positions(now - pd.Timedelta("10min"), now),
     )
 
@@ -255,7 +258,8 @@ def _replay_block(block_start: pd.Timestamp, sma_s: int, boat: str):
     start, end = block_start - warm, block_start + REPLAY_BLOCK
     (twd, tws), boat, pos = wd.parallel(
         lambda: wd.fetch_wind(start, end, wd.COURSE_WIND_MARKS),
-        lambda: wd.fetch_boat(start, end, boat),
+        # A block is fetched once and cached, so it can always carry the panels.
+        lambda: wd.fetch_boat(start, end, boat, stuck_panels=True),
         lambda: wd.fetch_positions(start, end),
     )
     return twd, tws, boat, pos
@@ -458,8 +462,12 @@ def compute_boat(b: pd.DataFrame) -> dict:
                                    "camber", "camber_pct")}
     r["rud_alarm"] = False
     r["camber_alarm"] = False
+    r["stuck"] = None
     if b.empty:
         return r
+    # Not gated on speed like the other alarms: a button stuck at the dock is
+    # just as stuck, and better found there.
+    r["stuck"] = stuck_buttons.read(b)
 
     def _last(col):
         if col not in b.columns:
@@ -697,6 +705,17 @@ def _tile(label: str, value: str, bg: str = "#ffffff", wide=False, small=False,
             f"{extra}</div>{sub}</div>")
 
 
+def _stuck_tile(stuck: list | None) -> str:
+    """The button's name in place of NONE, flashing, with where it is under it."""
+    if not stuck:
+        return _tile("Stuck Button", DASH if stuck is None else "NONE",
+                     wide=True, small=True)
+    where = " + ".join(w for _, w in stuck if w)
+    return _tile("Stuck Button", " + ".join(n for n, _ in stuck), wide=True,
+                 small=True, alarm=True,
+                 sub=f"<div class='sub'>{where}</div>" if where else "")
+
+
 def render(r: dict, rng: dict, b: dict, sma_min: int, boat: str) -> str:
     if r["deployed"]:
         axis = _tile("Course Axis", _deg(r["axis"]), wide=True)
@@ -733,6 +752,7 @@ def render(r: dict, rng: dict, b: dict, sma_min: int, boat: str) -> str:
         + _tile("Camber", _num(b.get("camber")))
         + _tile("Camber %", _num(b.get("camber_pct"), 0, "%"),
                 alarm=b.get("camber_alarm"))
+        + _stuck_tile(b.get("stuck"))
         + "</div>"
     )
 
@@ -962,6 +982,7 @@ ss.setdefault("board_bit", None)
 ss.setdefault("trace_html", None)   # last good height trace, held with the tiles
 ss.setdefault("feed_at", None)    # when the feed last failed, for the back-off
 ss.setdefault("feed_msg", None)   # and what it said, shown under the status line
+ss.setdefault("stuck", stuck_buttons.Namer())   # holds a stuck button's name
 
 with st.container(horizontal=True, horizontal_alignment="distribute"):
     mode = st.segmented_control("Mode", ["Live", "Replay"], default=ss["mode"],
@@ -976,7 +997,7 @@ if boat_pick and boat_pick != ss["boat"]:
     # splice two boats together and a dropped feed would put the old boat's
     # frame back up under the new name.
     ss.update(boat=boat_pick, board_buf=None, wind_html=None, board_html=None,
-              board_bit=None, trace_html=None)
+              board_bit=None, trace_html=None, stuck=stuck_buttons.Namer())
 
 replay_start = None
 if mode == "Replay":
@@ -1087,12 +1108,14 @@ def draw():
         try:
             if mode == "Live":
                 now = pd.Timestamp.utcnow().tz_localize(None)
-                (twd, tws), boat, pos = fetch_live(now, sma, ss["boat"])
+                asked = ss["stuck"].due(time.time())
+                (twd, tws), boat, pos = fetch_live(now, sma, ss["boat"], asked)
                 r = compute(twd, tws, pos, sma, wind_marks)
                 rng = live_range(now, r, wind_marks)
                 vnow, tag, replay = now, "live", False
             else:
                 vnow = virtual_now()
+                asked = True    # a replay block always carries the panels
                 twd, tws, boat, pos = fetch_replay(vnow, sma, ss["boat"])
                 r = compute(twd, tws, pos, sma, wind_marks)
                 # Replay already holds the whole window in the cached block, so
@@ -1105,7 +1128,9 @@ def draw():
             # The status line is drawn by the board fragment so it sits at the
             # bottom and, in replay, ticks once a second with the clock.
             ss["wind_bits"] = status_bits(r, tag, vnow, replay) + boat_bits(boat)
-            ss["wind_html"] = render(r, rng, compute_boat(boat), sma_min, ss["boat"])
+            trim = compute_boat(boat)
+            trim["stuck"] = ss["stuck"].update(trim["stuck"], asked, time.time())
+            ss["wind_html"] = render(r, rng, trim, sma_min, ss["boat"])
             ss["feed_at"] = ss["feed_msg"] = None
         except wd.FEED_ERRORS as e:
             feed_failed(e)
