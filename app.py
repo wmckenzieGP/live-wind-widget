@@ -228,8 +228,13 @@ def _range_lookback() -> pd.Timedelta:
 
 
 def fetch_live(now: pd.Timestamp, sma: pd.Timedelta, boat: str, stuck_panels: bool):
-    """Direct query, no cache and no buffering -- minimum possible delay."""
-    return wd.parallel(
+    """Direct query, no cache and no buffering -- minimum possible delay.
+
+    One after another, because this server answers side-by-side queries more
+    slowly: 1.07 s against 0.75 s for these three, and every moment here holds
+    the thread the board counter is waiting on.
+    """
+    return (
         # Only the five course marks carry wind we use; SL1/SL2 would be a
         # third more data over the wire for nothing.
         #
@@ -239,9 +244,9 @@ def fetch_live(now: pd.Timestamp, sma: pd.Timedelta, boat: str, stuck_panels: bo
         # time a pill is touched, so a mark switched back on would read dashes
         # until the next refetch. One mark's worth of rows is the cheaper side
         # of that trade.
-        lambda: wd.fetch_wind(now - _lookback(sma), now, wd.COURSE_WIND_MARKS),
-        lambda: wd.fetch_boat(now - BOAT_WINDOW, now, boat, stuck_panels),
-        lambda: wd.fetch_positions(now - pd.Timedelta("10min"), now),
+        wd.fetch_wind(now - _lookback(sma), now, wd.COURSE_WIND_MARKS),
+        wd.fetch_boat(now - BOAT_WINDOW, now, boat, stuck_panels),
+        wd.fetch_positions(now - pd.Timedelta("10min"), now),
     )
 
 
@@ -256,13 +261,13 @@ def _replay_block(block_start: pd.Timestamp, sma_s: int, boat: str):
     slices locally instead of re-querying every tick."""
     warm = max(_lookback(pd.Timedelta(seconds=sma_s)), _range_lookback())
     start, end = block_start - warm, block_start + REPLAY_BLOCK
-    (twd, tws), boat, pos = wd.parallel(
-        lambda: wd.fetch_wind(start, end, wd.COURSE_WIND_MARKS),
+    (twd, tws), frame, pos = (
+        wd.fetch_wind(start, end, wd.COURSE_WIND_MARKS),
         # A block is fetched once and cached, so it can always carry the panels.
-        lambda: wd.fetch_boat(start, end, boat, stuck_panels=True),
-        lambda: wd.fetch_positions(start, end),
+        wd.fetch_boat(start, end, boat, stuck_panels=True),
+        wd.fetch_positions(start, end),
     )
-    return twd, tws, boat, pos
+    return twd, tws, frame, pos
 
 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=32)

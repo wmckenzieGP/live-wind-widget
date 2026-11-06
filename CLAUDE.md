@@ -19,7 +19,12 @@ slowed the board's own tick. Do not retry it without new evidence.
 
 ## Workflow
 
-- Commit or push only when the user asks. Pushing restarts the live widget.
+- Commit or push only when the user asks.
+- **A push does not restart the widget.** Streamlit Cloud reloads `app.py` but keeps
+  other modules in memory, so a change across modules crashes it until a reboot:
+  `fa3b38c` took it down for about 5 minutes on 2026-11-05. After every push, use
+  Manage app > Reboot app, then open https://blackfoilswindwidget.streamlit.app/ and
+  check it draws. Do this only when nobody needs it on the water.
 - Keep any local run to one database connection: set `TSDB_MAX_CONNECTIONS=1`.
 - Test alarms by replaying a real fault. Live mode needs the boat to be streaming.
   Known faults are listed under "Stuck button" in `README.md`.

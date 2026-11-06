@@ -66,9 +66,9 @@ TSDB_CONNECT_TIMEOUT = int(_get("TSDB_CONNECT_TIMEOUT", 10))
 # us: past the role's cap the extras are refused at connect time, so asking for
 # more buys nothing and costs the first query that wants one.
 #
-# Three is what the widest fetch actually wants -- wind, boat and positions go
-# out together -- and more only helps when several people have the widget open
-# at once. The role allows 10 as of 2026-08-20, shared across every app on this
+# Each viewer runs one query at a time, so this is how many people can have the
+# widget open without queueing behind each other.
+# The role allows 10 as of 2026-08-20, shared across every app on this
 # login, so the rest is left for them. Override in secrets to move it without a
 # code change.
 TSDB_MAX_CONNECTIONS = max(1, int(_get("TSDB_MAX_CONNECTIONS", 3)))

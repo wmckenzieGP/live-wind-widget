@@ -220,20 +220,21 @@ from the rest of the widget:
 
 - **Its own 500 ms fragment.** It redraws on a separate timer. Waiting for the next
   redraw is dead time between data landing and a sailor seeing it, so the tick is
-  shorter than the wind's — but it cannot go much below this. The fetch itself
-  measures ~0.28 s, and a tick shorter than its own query only queues requests
-  faster than they come back; at 500 ms the query occupies a bit over half the
-  tick, which is the practical floor for polling. It has its own timer but **not
-  its own thread**, see below.
+  shorter than the wind's. A tick shorter than its own query only queues requests
+  faster than they come back. It has its own timer but **not its own thread**, see
+  below.
+- **One network round trip per query.** The database answers these queries almost
+  at once, so a query's time is the network. By default psycopg2 wraps each one in
+  `BEGIN` and `COMMIT`, which are two more round trips, so the pool's connections
+  run in autocommit. Measured on the same board query: 376 ms before, 116 ms after.
 - **A pool of warm TimescaleDB connections.** Opening a connection per query
   costs a TLS handshake — measured at 3.3 s against 1.0 s on a reused one. The
   pool (`TSDB_MAX_CONNECTIONS`, 3 by default) is shared by every query in the app. It is a
-  pool rather than a single shared connection because `parallel()` runs several
-  fetches at once and a psycopg2 connection is not thread-safe.
+  pool rather than a single shared connection because each viewer queries from its
+  own thread and a psycopg2 connection is not thread-safe.
 - **Incremental fetch.** A rolling 150-second trace is held in session state and
   extended with only the samples that arrived since the last one, typically
-  half a second's worth. A tick costs ~0.28 s of query and ~6 ms of counting.
-  If the buffer falls more than 20 s behind it is refilled outright rather than
+  half a second's worth. If the buffer falls more than 20 s behind it is refilled outright rather than
   spliced across a hole.
 
 The rolling window is anchored to the wall clock, not to the newest sample: a
@@ -249,12 +250,17 @@ slow it.** Two measured facts decide how a feature can be added:
 
 - **Streamlit runs both fragments one at a time, on one thread per session.** A
   board tick due during a wind poll waits for that poll to finish, so anything that
-  makes the wind poll longer delays the board counter. Measured in September, board
-  ticks ran 2.80 s apart at the median, not 500 ms.
+  makes the wind poll longer delays the board counter. That thread has a fixed
+  budget: with three round trips per query, 6 board ticks and 3 wind queries came to
+  about 3.3 s of work in every 3 s, so it could never catch up. Run on one thread
+  with the real queries and the same timers for 120 s, 167 of 240 board ticks ran
+  with three round trips and 238 with one, 90 % of gaps were within 1.72 s and 0.74 s,
+  and the wind poll held the thread for 1.27 s and 0.51 s.
 - **A background thread is not a way out.** The server serves concurrent queries
   worse than sequential ones: the board's own tick went from ~0.33 s to ~1.12 s
   while a second thread queried. That line of work took board delays to 5 s and
-  more, and was reverted on 2026-09-06 (`631b979`).
+  more, and was reverted on 2026-09-06 (`631b979`). The wind poll's own three queries
+  run one after another for the same reason: 0.75 s, against 1.07 s side by side.
 
 So for any new feature:
 
@@ -440,7 +446,6 @@ only and contains live credentials.
 | `tsdb_config.py` | Credentials and TLS material (shared migration kit) |
 | `tsdb_client.py` / `pivot_template.sql` | Query layer: pooled connections, pivots, latest-value lookups (shared migration kit) |
 
-Each poll runs its queries concurrently (`wind_data.parallel`), so the cycle
-costs about as long as its slowest query rather than their sum. Two fragments
-drive the page on separate timers: wind and trim on the slow one, board cycling
-on its own 500 ms tick.
+Each poll runs its queries one after another. Two fragments drive the page on
+separate timers: wind and trim on the slow one, board cycling on its own 500 ms
+tick.

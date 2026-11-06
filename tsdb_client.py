@@ -92,7 +92,15 @@ class TSDBClient:
     def _acquire(self):
         """-> (connection, disposition) where disposition says how to release."""
         if self._pool is not None:
-            return self._pool.getconn(), "pool"
+            conn = self._pool.getconn()
+            # Reads only, so no transaction. Left to its default psycopg2 wraps
+            # every query in BEGIN and COMMIT, each a network round trip of its
+            # own: 376 ms against 116 ms for the same board query, measured.
+            # Time spent on those holds the one script thread the board counter
+            # shares with the wind poll. It also keeps each query on a fresh
+            # snapshot, so the commit in `_execute` becomes a no-op.
+            conn.autocommit = True
+            return conn, "pool"
         if not self.persistent:
             return self._connect(), "close"
         if self._conn is None or self._conn.closed:

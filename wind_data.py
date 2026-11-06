@@ -12,7 +12,6 @@ the wind sits near 0/360. TWS is scalar, so `mean` is fine.
 from __future__ import annotations
 
 import atexit
-from concurrent.futures import ThreadPoolExecutor
 
 import arrow
 import pandas as pd
@@ -319,26 +318,6 @@ def fetch_positions(start, end, marks: list[str] | None = None) -> dict[str, tup
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def parallel(*calls):
-    """Run zero-argument fetches and return their results in order.
-
-    Concurrently where the connection budget allows it: each poll needs several
-    independent queries, and run one after another they add up to more than the
-    refresh interval. Nothing here touches Streamlit, so worker threads are
-    safe.
-
-    On a single connection they take turns instead. Threads would only queue on
-    the same connection anyway, and doing it here keeps the waiting out of the
-    pool, where it costs a thread apiece for nothing.
-    """
-    if not calls:
-        return []
-    if MAX_CONNECTIONS < 2 or len(calls) == 1:
-        return [c() for c in calls]
-    with ThreadPoolExecutor(max_workers=min(len(calls), MAX_CONNECTIONS)) as ex:
-        return [f.result() for f in [ex.submit(c) for c in calls]]
-
 
 def latest_data_time():
     """Most recent mark timestamp, or None. Used to tell whether anything is
