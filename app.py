@@ -77,7 +77,11 @@ CAMBER_MIN_TARGET = 1.0           # below this no camber is set, so no percentag
 # penalty, so this counter is fed back to the sailors live and is the one
 # metric where lag actually costs something. It redraws on its own timer,
 # independent of the wind tiles, and fetches only the delta each tick.
-BOARD_LIMIT = 6
+# The rule may drop to four (user, 2026-11-11: not confirmed), so the limit is a
+# selector in the top bar, default 4. It only changes the number the movements
+# are subtracted from: the query, the tick and the movement detection are untouched.
+BOARD_LIMITS = (4, 6)
+BOARD_LIMIT = 4                       # default until the rule is confirmed
 BOARD_WINDOW = pd.Timedelta("60s")
 BOARD_BUFFER = pd.Timedelta("150s")   # trace held locally; > window, for warm-up
 # Half a second, not a second: waiting for the next redraw is dead time between
@@ -615,7 +619,7 @@ def board_buffer(now: pd.Timestamp, boat: str) -> pd.DataFrame:
     return buf
 
 
-def board_counts(buf: pd.DataFrame, now: pd.Timestamp) -> dict:
+def board_counts(buf: pd.DataFrame, now: pd.Timestamp, limit: int = BOARD_LIMIT) -> dict:
     """Movements left on each board inside the rolling minute.
 
     The window is anchored to the wall clock, not to the newest sample -- a
@@ -635,7 +639,7 @@ def board_counts(buf: pd.DataFrame, now: pd.Timestamp) -> dict:
             continue
         used = [t for t in board_movements(v, BOARD_THRESH_MM) if t > cutoff]
         r["moves"][side] = len(used)
-        r[side] = BOARD_LIMIT - len(used)
+        r[side] = limit - len(used)
     return r
 
 
@@ -780,7 +784,7 @@ def render_boards(c: dict) -> str:
         return _tile(label, val, bg)
 
     return ("<div class='grid'>"
-            + "<div class='sect'>Board Cycling</div>"
+            + f"<div class='sect'>Board Cycling &middot; {ss['board_limit']} per minute</div>"
             + cell("Available Port", "port", PORT_BG)
             + cell("Available Stbd", "stbd", STBD_BG)
             + "</div>")
@@ -988,12 +992,20 @@ ss.setdefault("trace_html", None)   # last good height trace, held with the tile
 ss.setdefault("feed_at", None)    # when the feed last failed, for the back-off
 ss.setdefault("feed_msg", None)   # and what it said, shown under the status line
 ss.setdefault("stuck", stuck_buttons.Namer())   # holds a stuck button's name
+ss.setdefault("board_limit", BOARD_LIMIT)       # movements per board per minute: 4 or 6
 
 with st.container(horizontal=True, horizontal_alignment="distribute"):
     mode = st.segmented_control("Mode", ["Live", "Replay"], default=ss["mode"],
                                 key="mode_ctl", label_visibility="collapsed")
     boat_pick = st.segmented_control("Boat", wd.BOATS, default=ss["boat"],
                                      key="boat_ctl", label_visibility="collapsed")
+    limit_pick = st.segmented_control("Board limit", [f"{n} / min" for n in BOARD_LIMITS],
+                                      default=f"{ss['board_limit']} / min",
+                                      key="limit_ctl", label_visibility="collapsed")
+if limit_pick and int(limit_pick.split()[0]) != ss["board_limit"]:
+    # Arithmetic only: the held buffer stays, so nothing is refetched and the
+    # counter carries on from the same data on its next tick.
+    ss["board_limit"] = int(limit_pick.split()[0])
 if mode and mode != ss["mode"]:
     ss.update(mode=mode, playing=False, elapsed=0.0, wall=None)
 mode = ss["mode"]
@@ -1162,7 +1174,7 @@ def draw_boards():
                 now = virtual_now()
                 buf = _upto(_replay_board(now.floor(REPLAY_BLOCK), ss["boat"]), now)
 
-            counts = board_counts(buf, now)
+            counts = board_counts(buf, now, ss["board_limit"])
             ss["board_html"] = render_boards(counts)
             ss["board_bit"] = board_age_bit(counts)
             # Same buffer, same tick, same wall clock as the counter above it --

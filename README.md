@@ -167,8 +167,16 @@ for the first 3 s of a fault it reads `BUTTON STUCK`.
 
 More than six daggerboard movements inside a rolling minute is a penalty, so
 these two tiles count down what is left rather than up what has been used:
-**Available Port** (red) and **Available Stbd** (green), from 6 down through 0
-and into negative numbers once the limit is passed. Movements age out
+**Available Port** (red) and **Available Stbd** (green), from the limit down
+through 0 and into negative numbers once it is passed.
+
+**The limit is a selector in the top bar: 4 / min or 6 / min, default 4** (user,
+2026-11-11: the rule may drop from six to four, not confirmed yet). The section
+title shows the one in use. It only changes the number the movements are taken
+from: the board query, its tick and the movement detection are the same, and the
+held trace is kept when it changes, so nothing is refetched. Checked on B15
+10 Nov 14:17-14:59 UTC, 85 ticks: at 6 the counts equal the previous code's
+exactly, and at 4 they are exactly two fewer. Movements age out
 individually as they fall out of the 60-second window, so the count climbs back
 one at a time.
 
